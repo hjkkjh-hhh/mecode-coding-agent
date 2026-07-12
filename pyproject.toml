@@ -1,0 +1,27 @@
+# mecode 打包配置：pip install -e . 后获得全局 `mecode` 命令（无参=TUI，-p=无头一次性）。
+# 依赖与 requirements.txt 同步维护（requirements 供不装包、直接跑 scripts/ 的用法）。
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mecode"
+version = "0.0.1"
+description = "面向国产模型生态的、可读可学的 coding agent harness"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "textual>=1.0",
+    "ddgs>=9.0",
+]
+
+[project.scripts]
+mecode = "mecode.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mecode = ["skills_builtin/**/*"]

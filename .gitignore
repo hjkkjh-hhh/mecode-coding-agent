@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.mecode/
+.env
+.venv/
+venv/
+*.log
+.DS_Store
+.idea/
+.vscode/
+# 服务器/运维脚本(含服务器地址)，本地保留、不进仓库
+ops/
+# 研究素材(第三方系统提示词抓取副本)与调试抓包，本地保留、不对外
+claude-systemprompt
+输出和回复
