@@ -27,6 +27,7 @@ try:
 except ImportError:
     pass
 
+import rich.cells as _rich_cells                       # noqa: E402
 from rich.cells import cell_len                         # noqa: E402
 from rich.style import Style                            # noqa: E402
 from rich.text import Text                              # noqa: E402
@@ -78,6 +79,31 @@ def _is_error_result(result: str) -> bool:
 def _clip(s: str, n: int) -> str:
     s = s.replace("\n", " ")
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# Emoji 的 VS16（例如 ⚠️ = U+26A0 U+FE0F）在不同终端里可能实际推进 1 或 2 格。
+# Rich 按 Unicode 规范默认算 2；若终端实际只推进 1，同行右侧的滚动条/分割线就会整体左漂一格。
+# 保留字面 Emoji（不能删 VS16，否则会退成黑白文本符号），只在启动探测出“终端按 1 格画”时
+# 改 Rich 的计宽规则。Textual 各模块引用的是 rich.cells.cached_cell_len；清同一个缓存即可全局生效。
+_RICH_CELL_LEN = _rich_cells._cell_len
+_vs16_cell_width = 2
+
+
+def _set_vs16_cell_width(width: int) -> None:
+    """让 Rich/Textual 对 VS16 emoji 的计宽与当前终端一致；不修改实际显示字符。"""
+    global _vs16_cell_width
+    if width not in (1, 2):
+        raise ValueError("VS16 emoji width must be 1 or 2")
+    _vs16_cell_width = width
+    if width == 1:
+        # 终端忽略 VS16 的“窄变宽”语义时，Rich 也按去掉 VS16 后的基字符宽度计算。
+        # 宽基字符（🚀 等）本来就是 2 格，不受影响；⚠️/❤️ 这类则从 2 改为 1。
+        _rich_cells._cell_len = lambda text, unicode_version: _RICH_CELL_LEN(
+            text.replace("\ufe0f", ""), unicode_version
+        )
+    else:
+        _rich_cells._cell_len = _RICH_CELL_LEN
+    _rich_cells.cached_cell_len.cache_clear()
 
 
 # textual 7.4.0 的 Markdown：无语言代码块用 highlight() 做“通用高亮”，会把树形字符 │├└─ 误判成 error
@@ -2226,6 +2252,8 @@ class MecodeApp(App):
         self._plan_target: str | None = None   # "计划待批准"时，批准后以哪个执行模式跑（⇆ 可切；默认 _last_exec_mode）
         self._pending_plan = ""                 # 当前待批准的计划正文（"查看计划"弹窗展示用；计划不铺进对话）
         self._pending_switch = False            # /config 保存时本轮还在跑 → 收尾时再热切后端
+        self._emoji_probe_pending = False       # 启动时测 VS16 emoji 在当前终端实际占 1/2 格
+        self._emoji_probe_timer = None
 
     # ---- 键位 action ----
 
@@ -2457,10 +2485,56 @@ class MecodeApp(App):
         self._wire_bg()
         self.set_interval(0.5, self._sync_bgtasks)    # 常驻刷新后台任务行（含空闲时；更新“已 Ns”、增删行）
         self.query_one("#input", InputArea).focus()
+        # 等首帧画完再探测，避免和终端进入 application mode 的初始化序列交叉。
+        # 探测只改计宽、不改字符，所以彩色 emoji 原样保留。
+        self.call_after_refresh(self._probe_emoji_width)
         if self._mcp_servers:              # 有配置 → 后台连 MCP（不卡启动）
             self._connect_mcp()
         # 首次运行（config.json 无 model；.env 配了也不算——统一以 config 为准）：不强弹引导，
         # 侧栏模型区显示"未选择模型 · 输入 /config 配置"（见 _update_sidebar），用户 /config 自己来。
+
+    def _probe_emoji_width(self) -> None:
+        """用 CPR 实测 ⚠️ 的光标推进量；Windows/VS Code/VTE 等主流终端都支持。
+
+        可用 MECODE_TUI_VS16_WIDTH=1/2 强制覆盖（终端不回 CPR 或特殊 SSH 链路时兜底）。
+        探测序列先保存光标、在左上角输出 emoji 并查询位置、随后立即恢复光标；收到回报后全屏重画，
+        不把探针留在界面上。
+        """
+        forced = os.getenv("MECODE_TUI_VS16_WIDTH", "").strip()
+        if forced in ("1", "2"):
+            _set_vs16_cell_width(int(forced))
+            self.screen.refresh(repaint=True, layout=True)
+            return
+        if not self.console.is_terminal:
+            return
+        try:
+            self._emoji_probe_pending = True
+            # ESC 7/8 保存/恢复光标。尾随 ASCII 哨兵强制终端先完成 emoji cluster，再用
+            # “CPR 零基 x - 1 个哨兵格”得到 emoji 的实际宽度。
+            self._driver.write("\x1b7\x1b[1;1H⚠️X\x1b[6n\x1b8")
+            self._driver.flush()
+            self._emoji_probe_timer = self.set_timer(0.4, self._finish_emoji_probe)
+        except Exception:
+            self._emoji_probe_pending = False   # 特殊/无头 driver：保留 Unicode 标准的 2 格规则
+            self.screen.refresh(repaint=True, layout=True)
+
+    @on(events.CursorPosition)
+    def _on_emoji_cursor_position(self, event: events.CursorPosition) -> None:
+        if not self._emoji_probe_pending or event.y != 0 or event.x not in (2, 3):
+            return
+        self._emoji_probe_pending = False
+        if self._emoji_probe_timer is not None:
+            self._emoji_probe_timer.stop()
+            self._emoji_probe_timer = None
+        _set_vs16_cell_width(event.x - 1)
+        event.stop()
+        self.screen.refresh(repaint=True, layout=True)
+
+    def _finish_emoji_probe(self) -> None:
+        """终端没回 CPR 时停止等待，并重画被探针短暂覆盖的左上角。"""
+        self._emoji_probe_pending = False
+        self._emoji_probe_timer = None
+        self.screen.refresh(repaint=True, layout=True)
 
     def _wire_bg(self) -> None:
         """把后台任务 / 任务清单的变更回流到 UI（均随 resume 重建 Agent，故 on_mount 和 _resume_into 都调）：

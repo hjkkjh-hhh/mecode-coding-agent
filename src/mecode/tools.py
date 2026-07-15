@@ -179,8 +179,13 @@ def _bash_command(command: str) -> list[str]:
 def _bash_description() -> str:
     # 执行和描述共用 _detect_shell，二者永远一致：选哪个 shell，就让模型用哪种语法。
     _, hint = _detect_shell()
-    return ("在 shell 里执行一条命令，返回 stdout、stderr 和非零退出码。"
+    desc = ("在 shell 里执行一条命令，返回 stdout、stderr 和非零退出码。"
             f"默认超时 30 秒，可用 timeout（秒）调整。当前请用 {hint}。")
+    if os.name == "nt":
+        # Windows 三种 shell 通用坑：调 Python 用 python，别用 python3——后者常指向微软商店的
+        # 应用执行别名占位程序（WindowsApps\python3.exe），静默失败、退出码 49、无任何输出。
+        desc += "调用 Python 请用 python（不要用 python3，它在 Windows 上多是商店占位程序、会静默失败退出 49）。"
+    return desc
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:

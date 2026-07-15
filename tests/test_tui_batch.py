@@ -12,6 +12,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import tui   # noqa: E402
 
 
+def test_VS16字宽校准保留彩色emoji原文():
+    warning = "⚠️"
+    rocket = "🚀"
+    try:
+        tui._set_vs16_cell_width(1)
+        assert warning == "⚠️"                 # 校准只改计宽，不能删 VS16 / 改成文本符号
+        assert tui.cell_len(warning) == 1
+        assert tui.cell_len(rocket) == 2        # 原生双宽 emoji 不受影响
+
+        tui._set_vs16_cell_width(2)
+        assert tui.cell_len(warning) == 2
+        assert tui.cell_len(rocket) == 2
+    finally:
+        tui._set_vs16_cell_width(2)              # 不污染后续测试的全局 Rich 计宽状态
+
+
 def test_分组键映射():
     assert tui._tool_class("read_file") == "explore"
     assert tui._tool_class("grep") == "explore"
