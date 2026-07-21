@@ -1,6 +1,6 @@
 # mecode
 
-![tests](https://img.shields.io/badge/tests-354_passed-brightgreen)
+![tests](https://img.shields.io/badge/tests-360_passed-brightgreen)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![models](https://img.shields.io/badge/models-Kimi_·_DeepSeek_·_GLM_·_MiniMax-orange)
 ![lines](https://img.shields.io/badge/lines-13.4k-lightgrey)
@@ -69,7 +69,7 @@
 | 模型配置 | `config.py` + `registry.py` | config.json 单一真相源、/config 可视化配置、热切换(不重启) |
 | TUI | `scripts/tui.py` | textual 终端界面:流式渲染、工具批折叠、审批弹窗、可拖侧栏 |
 
-354 个测试(pytest),覆盖每个子系统的关键不变量。
+360 个测试(pytest),覆盖每个子系统的关键不变量。
 
 ## 整体架构
 
@@ -167,7 +167,7 @@ mecode -p "总结这个项目" --mode auto          # 一次性:跑完打印答�
 ```
 src/mecode/     框架本体(库,可 import):agent/provider/tools/… + bootstrap(headless 工厂) + cli(mecode 命令)
 scripts/        应用层入口:tui.py(主界面)、chat.py(调试 CLI)、raw_probe.py(裸流探针)
-tests/          354 个单元/集成测试
+tests/          360 个单元/集成测试
 ```
 
 ## 背景

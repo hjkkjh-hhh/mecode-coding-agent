@@ -144,6 +144,52 @@ def test_bash_命令放在argv最后():
     assert _bash_command("echo hi")[-1] == "echo hi"
 
 
+# ---- Windows 退出码翻译 ----
+# 命令无任何 stdout/stderr、只剩一个裸退出码时，模型无从判断。9009 是 Windows"命令找不到"的
+# 约定码（cmd 的"不是内部或外部命令"、商店应用执行别名未装应用时都返回它），bash 截成 8 位 = 49。
+# 【只翻译不建议】：下一步换命令还是装依赖，交给模型自己判断。
+
+def test_退出码翻译_9009与截断的49都认(monkeypatch):
+    from mecode import tools
+    monkeypatch.setattr(tools.os, "name", "nt")
+    assert "命令找不到" in tools._exit_code_note(9009)
+    assert "命令找不到" in tools._exit_code_note(49)     # bash 把 9009 截成 8 位，同一件事
+
+
+def test_退出码翻译_只给含义_不给建议也不讲词源(monkeypatch):
+    # 刻意不出现：①"请改用 X"这类指令（会掐掉模型的其他选项：装依赖/查 PATH/换工具）；
+    # ②"49 是 9009 截断"这类词源（对模型不构成行动信息，该待在代码注释里给人看）。
+    from mecode import tools
+    monkeypatch.setattr(tools.os, "name", "nt")
+    note = tools._exit_code_note(49)
+    assert "请改用" not in note and "python" not in note.lower()
+    assert "9009" not in note and "截断" not in note
+    assert len(note) < 60                              # 一句话，别再长回去
+
+
+def test_退出码翻译_无关码与非windows都不吭声(monkeypatch):
+    from mecode import tools
+    monkeypatch.setattr(tools.os, "name", "nt")
+    assert tools._exit_code_note(1) == "" and tools._exit_code_note(127) == ""   # 别的码有各自含义，不瞎猜
+    monkeypatch.setattr(tools.os, "name", "posix")
+    assert tools._exit_code_note(49) == ""      # POSIX 上 49 是普通退出码，翻译反而误导
+
+
+def test_bash_静默的找不到_结果里带翻译(monkeypatch):
+    from mecode import tools
+    monkeypatch.setattr(tools, "_exit_code_note", lambda c: "（假翻译）")
+    out = tools._bash({"command": "exit 49"})
+    assert "(exit code: 49)" in out and "（假翻译）" in out
+
+
+def test_bash_有输出的失败_不加翻译(monkeypatch):
+    # 已经有 stderr 可读时不画蛇添足（翻译只补"零线索"那种失败）
+    from mecode import tools
+    monkeypatch.setattr(tools, "_exit_code_note", lambda c: "（不该出现）")
+    out = tools._bash({"command": "echo boom 1>&2; exit 3"})
+    assert "(exit code: 3)" in out and "不该出现" not in out
+
+
 def test_procslot_kill杀登记的进程_clear后不再杀(monkeypatch):
     import threading
     from mecode import tools

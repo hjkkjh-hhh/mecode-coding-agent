@@ -176,16 +176,33 @@ def _bash_command(command: str) -> list[str]:
     return prefix + [command]
 
 
+# Windows 上"命令找不到"的约定退出码：9009（cmd 的"不是内部或外部命令"就是它；商店的应用执行
+# 别名在对应应用未安装时也返回它）。POSIX 退出码只有 8 位，git-bash 会把它截断：9009 & 0xFF = 49，
+# 所以同一件事在 bash 下显示为 49、在 PowerShell/cmd 下显示为 9009。
+_WIN_NOT_FOUND_CODES = (9009, 49)
+
+
+def _exit_code_note(code: int) -> str:
+    """把 Windows 上含义明确、但数字本身完全看不出名堂的退出码翻成人话。
+    只在命令【无任何 stdout/stderr】时补——那种情况模型手里只剩一个裸数字，无从判断。
+
+    刻意【只翻译、不建议】：说清这个码通常意味着什么就停，下一步是换命令名、装依赖、
+    还是查 PATH，交给模型自己判断。harness 的职责是把事实讲准，替它选下一步会限制它的思路。
+
+    措辞用"通常表示"而非断言：任何程序都可以自行 exit(49)，实测 `python -c "sys.exit(49)"`
+    的签名（退出码 49 + 空输出）与商店别名占位完全相同，无法区分，所以不能把话说死。"""
+    if os.name != "nt" or code not in _WIN_NOT_FOUND_CODES:
+        return ""
+    # 只给含义，不给词源：49 是 9009 截断这件事写在上面的常量注释里（给读源码的人），
+    # 对模型不构成任何行动信息；也不展开"名字不存在 or 程序没装"——那是同义反复 + 越俎代庖。
+    return f"（退出码 {code} 在 Windows 上通常表示「命令找不到 / 不是内部或外部命令」。）"
+
+
 def _bash_description() -> str:
     # 执行和描述共用 _detect_shell，二者永远一致：选哪个 shell，就让模型用哪种语法。
     _, hint = _detect_shell()
-    desc = ("在 shell 里执行一条命令，返回 stdout、stderr 和非零退出码。"
+    return ("在 shell 里执行一条命令，返回 stdout、stderr 和非零退出码。"
             f"默认超时 30 秒，可用 timeout（秒）调整。当前请用 {hint}。")
-    if os.name == "nt":
-        # Windows 三种 shell 通用坑：调 Python 用 python，别用 python3——后者常指向微软商店的
-        # 应用执行别名占位程序（WindowsApps\python3.exe），静默失败、退出码 49、无任何输出。
-        desc += "调用 Python 请用 python（不要用 python3，它在 Windows 上多是商店占位程序、会静默失败退出 49）。"
-    return desc
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -533,6 +550,10 @@ def _bash(args: dict, slot: "ProcSlot | None" = None,
         parts.append(f"[stderr]\n{err}")
     if proc.returncode != 0:
         parts.append(f"(exit code: {proc.returncode})")
+        if not out and not err:            # 无任何输出、只剩裸退出码 → 能翻译的就翻成人话
+            note = _exit_code_note(proc.returncode)
+            if note:
+                parts.append(note)
     return "\n".join(parts) if parts else "（命令执行成功，无输出）"
 
 
