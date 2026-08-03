@@ -17,13 +17,16 @@ Skill = 一个文件夹里的 SKILL.md：frontmatter（name/description）+ 正�
   ~/.mecode/skills/<名>/SKILL.md         用户级
   src/mecode/skills_builtin/<名>/SKILL.md  内置（随包分发，如 mcp-install）
 
-启停：状态存 ~/.mecode/skills_state.json（{"disabled": [名...]}，默认全启用）。
+启停：用户级状态存 ~/.mecode/skills_state.json（{"disabled": [名...]}，默认全启用）；
+另认项目级 <项目>/.mecode/skills_state.json，两份禁用名单取并集——部署型项目（如网关
+工作区）可只在本项目屏蔽某技能（含内置），不动用户全局状态。
 停用 = 不进索引（模型不知道存在）+ 面板选中提示先启用。改状态【新会话生效】——
 当前会话的 system prompt 不动（不击穿 prompt 缓存、也不产生"模型记得旧列表"的歧义）。
 """
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +34,9 @@ SKILL_FILE = "SKILL.md"
 BUILTIN_DIR = Path(__file__).resolve().parent / "skills_builtin"   # 内置（随包分发）
 USER_SKILLS_DIR = Path("~/.mecode/skills").expanduser()            # 用户级（所有项目）
 STATE_PATH = Path("~/.mecode/skills_state.json").expanduser()      # 启停状态（禁用名单）
-INDEX_BUDGET = 2000     # 索引段字符预算（Codex 用 2% 窗口/8K 字符的思路）：超了截断+提示
+# 索引段字符预算（Codex 用 2% 窗口/8K 字符的思路）：超了截断+提示。
+# 默认按交互 TUI 场景取 2000；技能多的部署场景（如网关工作区十几个技能）用环境变量调大
+INDEX_BUDGET = int(os.environ.get("MECODE_SKILLS_INDEX_BUDGET", "2000"))
 
 
 @dataclass(frozen=True)
@@ -102,11 +107,18 @@ def _scan_dir(root: Path, source: str) -> list[Skill]:
     return out
 
 
-def _load_disabled() -> set[str]:
-    try:
-        return set(json.loads(STATE_PATH.read_text(encoding="utf-8")).get("disabled", []))
-    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
-        return set()          # Attr/Type：文件被手改成数组/字符串等非 dict 形态 → 同"坏文件"，当空处理
+def _load_disabled(project_root: Path | None = None) -> set[str]:
+    """禁用名单 = 用户级 ∪ 项目级（<项目>/.mecode/skills_state.json）。"""
+    disabled: set[str] = set()
+    paths = [STATE_PATH]
+    if project_root is not None:
+        paths.append(Path(project_root) / ".mecode" / "skills_state.json")
+    for p in paths:
+        try:
+            disabled |= set(json.loads(p.read_text(encoding="utf-8-sig")).get("disabled", []))
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+            continue          # Attr/Type：文件被手改成数组/字符串等非 dict 形态 → 同"坏文件"，当空处理
+    return disabled
 
 
 def set_enabled(name: str, enabled: bool) -> None:
@@ -125,7 +137,7 @@ def discover_skills(project_root: Path | None = None) -> list[Skill]:
     if project_root is not None:
         roots.append((Path(project_root) / ".mecode" / "skills", "项目"))
     roots += [(USER_SKILLS_DIR, "用户"), (BUILTIN_DIR, "内置")]
-    disabled = _load_disabled()
+    disabled = _load_disabled(project_root)
     seen: set[str] = set()
     out: list[Skill] = []
     for root, source in roots:

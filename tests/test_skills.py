@@ -65,6 +65,20 @@ def test_启停_写状态文件_停用不进索引(tmp_path, monkeypatch):
     assert all(s.enabled for s in sk.discover_skills(None))
 
 
+def test_项目级禁用_不动用户全局(tmp_path, monkeypatch):
+    _isolate(tmp_path, monkeypatch)
+    _mk_skill(tmp_path / "builtin", "mcp-install", desc="内置")
+    _mk_skill(tmp_path / "builtin", "skill-install", desc="内置")
+    proj = tmp_path / "proj"
+    (proj / ".mecode").mkdir(parents=True)
+    # 故意带 BOM 写(Windows 的 Out-File/记事本常这么干),锁定读取侧的容错
+    (proj / ".mecode" / "skills_state.json").write_bytes(
+        b'\xef\xbb\xbf{"disabled": ["mcp-install", "skill-install"]}')
+    enabled_in_proj = {s.name: s.enabled for s in sk.discover_skills(proj)}
+    assert enabled_in_proj == {"mcp-install": False, "skill-install": False}   # 项目内被屏蔽
+    assert all(s.enabled for s in sk.discover_skills(None))                    # 用户全局不受影响
+
+
 def test_索引段_空则省略_含路径和指引(tmp_path, monkeypatch):
     _isolate(tmp_path, monkeypatch)
     assert sk.build_skills_prompt([]) == ""                # 没 skill → 整段省略

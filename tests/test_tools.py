@@ -345,6 +345,18 @@ def test_glob_递归跳噪音目录(tmp_path):
     assert "hook.py" not in out                              # .git 被跳过
 
 
+def test_glob_显式指进忽略目录_照常搜(tmp_path):
+    # 搜索根本身在噪音目录内（如 .mecode/skills/）时不应误伤——用户显式指路优先于噪音过滤
+    skill = tmp_path / ".mecode" / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("x", encoding="utf-8")
+    out = _exec("glob", pattern="**/*", path=str(skill))
+    assert "SKILL.md" in out
+    # 但从项目根默认递归时，.mecode 仍然被跳过
+    out2 = _exec("glob", pattern="**/*", path=str(tmp_path))
+    assert "SKILL.md" not in out2
+
+
 def test_glob_花括号展开(tmp_path):
     _make_glob_tree(tmp_path)
     out = _exec("glob", pattern="*.{py,md}", path=str(tmp_path))

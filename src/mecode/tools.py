@@ -78,6 +78,10 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         self._tools[tool.name] = tool
 
+    def unregister(self, name: str) -> None:
+        """移除一个已注册工具(不存在则无事)。部署方用于按场景裁剪内置工具。"""
+        self._tools.pop(name, None)
+
     def schemas(self) -> list[dict]:
         """给模型看的工具清单（OpenAI 函数调用格式）。"""
         return [
@@ -618,7 +622,8 @@ def _glob(args: dict) -> str:
     try:
         for pat in _expand_braces(pattern):
             for p in base.glob(pat):
-                if not p.is_file() or p in seen or set(p.parts) & GREP_IGNORE_DIRS:
+                # 噪音过滤只看搜索根以下的层级：显式指进 .mecode/.git 等目录时照常搜
+                if not p.is_file() or p in seen or set(p.relative_to(base).parts) & GREP_IGNORE_DIRS:
                     continue
                 seen.add(p)
                 matches.append(p)
@@ -707,7 +712,7 @@ def default_registry() -> ToolRegistry:
     ))
     reg.register(Tool(
         name="grep",
-        description="按正则在文件内容里搜索（递归，自动跳过 .git/node_modules 等目录和二进制文件）。output_mode：files_with_matches（默认，列出含匹配的文件）/ content（带行号的匹配行）/ count（每个文件的匹配数）。可用 glob 过滤文件名、case_insensitive 忽略大小写、head_limit 限制条数。",
+        description="按正则在文件内容里搜索（递归，自动跳过 .git/.mecode/node_modules 等噪音目录和二进制文件；path 显式指进这些目录时照常搜）。output_mode：files_with_matches（默认，列出含匹配的文件）/ content（带行号的匹配行）/ count（每个文件的匹配数）。可用 glob 过滤文件名、case_insensitive 忽略大小写、head_limit 限制条数。",
         parameters={
             "type": "object",
             "properties": {
@@ -726,7 +731,7 @@ def default_registry() -> ToolRegistry:
     ))
     reg.register(Tool(
         name="glob",
-        description="按路径模式查找文件名（不是搜内容——搜内容用 grep）。支持 ** 递归和 {a,b} 花括号，如 **/*.py、src/**/test_*.py、*.{py,md}。自动跳过 .git/node_modules 等，结果按修改时间倒序（最近改的在前）。",
+        description="按路径模式查找文件名（不是搜内容——搜内容用 grep）。支持 ** 递归和 {a,b} 花括号，如 **/*.py、src/**/test_*.py、*.{py,md}。自动跳过 .git/.mecode/node_modules 等噪音目录（path 显式指进这些目录时照常搜），结果按修改时间倒序（最近改的在前）。",
         parameters={
             "type": "object",
             "properties": {
