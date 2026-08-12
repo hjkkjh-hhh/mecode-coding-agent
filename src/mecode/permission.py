@@ -46,6 +46,8 @@ DEFAULT_RULES: dict[str, dict[str, list[str]]] = {
     "check_bgtask": {"allow": ["*"]},
     "wait_bgtask": {"allow": ["*"]},
     "kill_bgtask": {"allow": ["*"]},
+    # 提问工具：它的动作就是"弹界面问用户"本身，用户在弹窗里作答即完成把关 → 再过审批闸是双重打扰。
+    "ask_user": {"allow": ["*"]},
     # 派生子 agent：主 agent 既决定派活即信任（选项 a，子 agent 内部也 policy=None 全放）；且前台并发批会
     # 一次派多个，若逐个弹审批会 N 连问。故放行 subagent 本身（子 agent 内部动作的风险由"信任委派"承担）。
     "subagent": {"allow": ["*"]},

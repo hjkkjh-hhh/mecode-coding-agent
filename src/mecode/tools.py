@@ -756,3 +756,115 @@ def default_registry() -> ToolRegistry:
     for t in web_tools():          # web_search / web_fetch（只读联网，权限默认放行）
         reg.register(t)
     return reg
+
+
+# ---- ask_user：向用户提问（工厂——只由有交互界面的消费端注册；无头/网关场景没人可答，不进 default_registry） ----
+
+ASK_MAX_QUESTIONS = 4      # 一次最多问几题（对齐 Claude Code AskUserQuestion 的 1-4）
+ASK_MAX_OPTIONS = 4        # 每题最多几个选项（2-4；"其他"由界面自动附加，不占额度）
+ASK_HEADER_CHARS = 12      # header 显示上限（超长截断，不报错）
+
+
+def _validate_ask_questions(args: dict) -> list[dict] | str:
+    """校验并规范化 ask_user 的 questions 参数。合法返回规范化列表（question/header/options/multi_select
+    齐备、header 截到显示上限），非法返回错误字符串（喂回模型自纠）。"""
+    qs = args.get("questions")
+    if not isinstance(qs, list) or not 1 <= len(qs) <= ASK_MAX_QUESTIONS:
+        return f"错误：questions 必须是含 1-{ASK_MAX_QUESTIONS} 个问题对象的数组"
+    out = []
+    for i, q in enumerate(qs, 1):
+        if not isinstance(q, dict) or not str(q.get("question") or "").strip():
+            return f"错误：第 {i} 题缺少 question 文本"
+        opts = q.get("options")
+        if not isinstance(opts, list) or not 2 <= len(opts) <= ASK_MAX_OPTIONS:
+            return (f"错误：第 {i} 题的 options 必须是 2-{ASK_MAX_OPTIONS} 个选项"
+                    "（\"其他\"由界面自动附加，不要自己加）")
+        norm_opts = []
+        for j, o in enumerate(opts, 1):
+            if not isinstance(o, dict) or not str(o.get("label") or "").strip():
+                return f"错误：第 {i} 题第 {j} 个选项缺少 label"
+            norm_opts.append({"label": str(o["label"]).strip(),
+                              "description": str(o.get("description") or "").strip()})
+        ms = q.get("multi_select", False)
+        if isinstance(ms, str):               # 字符串化布尔（弱模型常见）按语义解析——bool("false") 是 True
+            ms = ms.strip().lower() == "true"
+        out.append({"question": str(q["question"]).strip(),
+                    "header": str(q.get("header") or "").strip()[:ASK_HEADER_CHARS],
+                    "options": norm_opts,
+                    "multi_select": bool(ms)})
+    if len({q["question"] for q in out}) != len(out):   # 答案按问题文本对应，重复文本会互相覆盖
+        return "错误：questions 中存在重复的问题文本，每题文本必须唯一"
+    return out
+
+
+def format_ask_result(res: dict | None) -> str:
+    """把提问界面的作答结果排成给模型看的文本。res 形如 {"answers": {问题: 答案}, "skipped": [问题]}，
+    答案是选项 label、"其他：自由文本"或多选的 label 列表；None 或 answers 为空 = 用户没答。"""
+    answers = (res or {}).get("answers") or {}
+    skipped = (res or {}).get("skipped") or []
+    if not answers:
+        return "用户跳过了提问，未作答。请按你的最佳判断继续，不要就同样的问题再次提问。"
+    lines = ["用户已作答："]
+    for q, a in answers.items():
+        lines.append(f"- {q} → {'、'.join(a) if isinstance(a, list) else a}")
+    if skipped:
+        lines.append("以下问题用户跳过未答，请按你的最佳判断处理：" + "；".join(skipped))
+    return "\n".join(lines)
+
+
+def make_ask_user_tool(ask_cb: Callable[[list[dict]], dict | None]) -> Tool:
+    """构造 ask_user 工具。ask_cb 由消费端注入：吃规范化 questions，弹界面阻塞等作答，
+    返回 {"answers": ..., "skipped": ...}（见 format_ask_result）；None=用户跳过全部或已中断。"""
+    def _ask_user(args: dict) -> str:
+        qs = _validate_ask_questions(args)
+        if isinstance(qs, str):
+            return qs
+        return format_ask_result(ask_cb(qs))
+
+    return Tool(
+        name="ask_user",
+        description=(
+            "向用户提出 1-4 个选择题并等待作答（阻塞到用户答完或跳过）。只在被一个属于用户的决策"
+            "阻塞、且从上下文和常规默认推不出答案时使用；能自行决定的事项不要提问，自己定并在回复里"
+            "说明即可。每题给 2-4 个互斥选项；界面会自动附加\"其他（自由输入）\"项，不要自己加同类"
+            "选项。有推荐项时放在第一位并在 label 末尾标\"（推荐）\"。用户可能跳过提问，此时按返回"
+            "的提示自行判断继续。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "1-4 个问题",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string",
+                                         "description": "完整的问题，以问号结尾"},
+                            "header": {"type": "string",
+                                       "description": "该题的极短标签（≤12 字符），界面作题头显示"},
+                            "options": {
+                                "type": "array",
+                                "description": "2-4 个选项",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string",
+                                                  "description": "选项文字（1-5 个词）"},
+                                        "description": {"type": "string",
+                                                        "description": "该选项的含义与取舍说明"},
+                                    },
+                                    "required": ["label"],
+                                },
+                            },
+                            "multi_select": {"type": "boolean",
+                                             "description": "true=允许多选（选项非互斥时）；默认 false"},
+                        },
+                        "required": ["question", "options"],
+                    },
+                },
+            },
+            "required": ["questions"],
+        },
+        handler=_ask_user,
+    )

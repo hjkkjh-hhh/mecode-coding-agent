@@ -64,7 +64,7 @@ from mecode.registry import PROVIDERS, context_window_for   # noqa: E402
 from mecode.session import SessionStore                  # noqa: E402
 from mecode.skills import discover_skills, set_enabled, skill_reminder   # noqa: E402
 from mecode.system_prompt import build_system_prompt     # noqa: E402
-from mecode.tools import default_registry                # noqa: E402
+from mecode.tools import default_registry, make_ask_user_tool   # noqa: E402
 
 
 def _is_error_result(result: str) -> bool:
@@ -153,6 +153,13 @@ def _summarize_tool(name: str, args: dict) -> str:
         return args.get("pattern", "") + (f" in {p}" if p else "")
     if name == "subagent":                       # 子 agent：标题显示短标签 description（无则退回 prompt；截断由外层 _clip 处理）
         return (args.get("description") or args.get("prompt", "")).replace("\n", " ")
+    if name == "ask_user":                       # 提问：标题显示首题（多题标条数）
+        # 渲染发生在工具校验之前（ToolStarted 先于 execute），模型吐畸形形状时这里必须自防——
+        # 异常会落在 UI 线程的消息 handler 里，直接崩整个 app。畸形就落回下方通用 key=value 展示。
+        qs = args.get("questions")
+        if isinstance(qs, list) and qs and isinstance(qs[0], dict):
+            first = str(qs[0].get("question") or "").replace("\n", " ")
+            return (f"{len(qs)} 题：" if len(qs) > 1 else "") + first
     return " ".join(f"{k}={str(v).replace(chr(10), ' ')}" for k, v in args.items())
 
 
@@ -170,6 +177,8 @@ def _tool_input_text(name: str, args: dict) -> str | None:
         return f"任务: {args.get('prompt', '')}"
     if name == "run_workflow":
         return _workflow_stages_text(args)
+    if name == "ask_user":
+        return _ask_questions_text(args)
     if name in ("edit_file", "write_file"):
         return None
     if not args:
@@ -198,6 +207,25 @@ def _workflow_stages_text(args: dict) -> str:
         dep = f"（依赖 {', '.join(s.get('after') or [])}）" if s.get("after") else "（并行起点）"
         lines.append(f"\n[{s.get('id', '?')}] {dep} {s.get('description', '')}")
         lines.append(f"  {s.get('prompt', '')}")
+    return "\n".join(lines)
+
+
+def _ask_questions_text(args: dict) -> str:
+    """ask_user 输入框内容：把每题的问题与选项铺成人读的多行（回看时能看清模型问了什么）。"""
+    qs = args.get("questions")
+    if not isinstance(qs, list):
+        return str(args)
+    lines = []
+    for i, q in enumerate(qs, 1):
+        if not isinstance(q, dict):
+            continue
+        tag = "（多选）" if q.get("multi_select") else ""
+        lines.append(f"{i}. {str(q.get('question') or '')}{tag}")
+        opts = q.get("options")
+        for o in opts if isinstance(opts, list) else []:   # 同为校验前渲染，标量 options 不能炸
+            if isinstance(o, dict):
+                d = o.get("description") or ""
+                lines.append(f"   - {o.get('label', '')}" + (f"：{d}" if d else ""))
     return "\n".join(lines)
 
 
@@ -287,6 +315,13 @@ class AskPermission(Message):
     """worker 线程请求 UI 弹审批弹窗（工具要执行 ask 类动作）。UI 答复经 threading.Event 回传 worker。"""
     def __init__(self, tool: str, args: dict) -> None:
         self.tool, self.args = tool, args
+        super().__init__()
+
+
+class AskQuestion(Message):
+    """worker 线程请求 UI 弹提问弹窗（ask_user 工具）。答复经 threading.Event 回传 worker。"""
+    def __init__(self, questions: list[dict]) -> None:
+        self.questions = questions
         super().__init__()
 
 
@@ -1210,6 +1245,347 @@ class PermissionModal(ModalScreen):
 
     def action_deny(self) -> None:
         self.dismiss("deny")
+
+
+class AskOtherInput(TextArea):
+    """提问弹窗"其他"的输入行：用主输入框（InputArea）同款 TextArea 而非 Input——真机实测
+    中文输入法对 Input 会把预编辑串错位到屏幕左上角、拼音字母漏进框里；TextArea 是本项目里
+    唯一经长期中文输入验证的部件。placeholder 原生支持（框内灰字提示）。Enter 提交；
+    Esc 不拦（默认 tab_behavior="focus" 不吃 escape），冒泡给弹窗做收起。"""
+
+    class Submitted(Message):
+        def __init__(self, value: str) -> None:
+            self.value = value
+            super().__init__()
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted(self.text))
+            return
+        await super()._on_key(event)
+
+    def on_show(self) -> None:
+        """display=False→True 与 focus() 同一拍执行时，focus 时刻算的输入法锚点用的是隐藏期的
+        空 region → (0,0)，输入法预编辑窗被钉到屏幕左上角、还会退化成生字母直发。可见后等一帧
+        布局完成再重钉锚点、再排一帧把终端真光标写进框内，预编辑串就回到输入位。"""
+        def pin() -> None:
+            if self.has_focus:
+                self.app.cursor_position = self.cursor_screen_offset
+                self.refresh()
+        self.call_after_refresh(pin)
+
+
+class _AskNavBtn(Static):
+    """提问弹窗右下角导航钮（上一题 / 下一题·完成）。点击转发弹窗对应 action（首题置灰等在 action 里自拦）。"""
+    def __init__(self, role: str, id: str) -> None:
+        super().__init__("", id=id, classes="ask-btn")
+        self._role = role
+
+    def on_click(self) -> None:
+        if self._role == "prev":
+            self.screen.action_prev_q()
+        else:
+            self.screen.action_next_q()
+
+
+class QuestionModal(ModalScreen):
+    """ask_user 提问弹窗：逐题作答，右下角「上一题 / 下一题·完成」可来回导航改答（首题隐藏上一题）。
+    单选 Enter 选中后选中行消失-出现闪烁两次（约 1 秒）自动跳下一题（期间可换选/导航，重新计时）；多选 Enter
+    勾/去勾，「下一题/完成」即提交本题；"其他"换出输入框自由作答。Esc 立即收卷：已答带回、未答进 skipped。
+    dismiss 返回 {"answers": {问题: 答案}, "skipped": [未答问题]}；答案=label / "其他：文本" / 多选 label 列表。"""
+    BINDINGS = [Binding("escape", "skip", "跳过"),
+                Binding("left", "prev_q", "上一题", show=False),
+                Binding("right", "next_q", "下一题", show=False)]
+    CSS = """
+    QuestionModal { align: center middle; background: $background 70%; }
+    #ask { width: 76; height: auto; padding: 1 2; border: round $accent; background: $surface; }
+    #ask-head { color: $text-muted; }
+    #ask-q { padding: 0 0 1 0; }
+    #ask-list { height: auto; max-height: 18; }
+    #ask-list > ListItem { padding: 0 1; }
+    #ask-other { height: 3; }
+    #ask-btns { height: 1; margin: 1 0 0 0; }
+    #ask-next { dock: right; }
+    .ask-btn { padding: 0 2; width: auto; background: $panel; }
+    .ask-btn:hover { background: $accent 50%; }
+    #ask-hint { color: $text-muted; padding: 1 0 0 0; }
+    """
+
+    def __init__(self, questions: list[dict]) -> None:
+        super().__init__()
+        self._qs = questions
+        self._idx = 0                     # 当前第几题
+        # 每题独立作答状态（「上一题」回看改答要能还原）：chosen=单选选中项下标（-1="其他"，None=未答）；
+        # checked=多选勾选集；other=该题"其他"的自由输入文本
+        self._state = [{"chosen": None, "checked": set(), "other": None} for _ in questions]
+        self._adv_timer = None            # 单选选中后"闪烁反馈→自动跳下一题"的定时器
+        self._flash_hide = False          # 闪烁相位（True=选中行处于"消失"拍）
+        self._done = False                # 已收卷（dismiss 后迟到的事件全部忽略）
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ask"):
+            yield Static("", id="ask-head")
+            yield Static("", id="ask-q")
+            yield ListView(id="ask-list")
+            inp = AskOtherInput(placeholder="输入自定义回答，Enter 确认", id="ask-other")
+            inp.cursor_blink = False       # 光标闪烁每 0.5s 重绘一帧，同样会顶走输入法预编辑串
+            inp.display = False
+            yield inp
+            with Horizontal(id="ask-btns"):
+                yield _AskNavBtn("prev", id="ask-prev")        # 常规流靠左
+                yield _AskNavBtn("next", id="ask-next")        # dock: right 钉右缘
+            yield Static("", id="ask-hint")
+
+    def on_mount(self) -> None:
+        self._show()
+
+    def _cur(self) -> dict:
+        return self._qs[self._idx]
+
+    def _st(self) -> dict:
+        return self._state[self._idx]
+
+    def _show(self, keep_index: int = 0) -> None:
+        """渲染当前题：题头 + 问题 + 选项列表（含作答态标记）+ 导航钮 + 操作提示。
+        keep_index=重建后光标落哪。"""
+        q = self._cur()
+        head = f"❓ 提问 第 {self._idx + 1}/{len(self._qs)} 题"
+        if q.get("header"):
+            head += f" · {q['header']}"
+        self.query_one("#ask-head", Static).update(Text(head, style="bold"))
+        self.query_one("#ask-q", Static).update(Text(q["question"], style="bold"))
+        inp = self.query_one("#ask-other", AskOtherInput)   # 换题统一收起输入框：用户可 Tab/鼠标绕开
+        inp.display = False                                 # 输入框直接答题推进，不复位会把残留文本错记
+        inp.load_text("")                                   # 成新题的"其他"答案
+        lv = self.query_one("#ask-list", ListView)
+        lv.clear()
+        for i in range(len(q["options"]) + 1):        # 选项行 + 末尾"其他"行
+            lv.append(ListItem(Static(self._row_text(i))))
+        last = self._idx == len(self._qs) - 1
+        prev = self.query_one("#ask-prev", _AskNavBtn)
+        prev.display = self._idx > 0                # 首题没有"上一题"：整个隐藏而非置灰
+        prev.update(Text("‹ 上一题", style="bold"))
+        self.query_one("#ask-next", _AskNavBtn).update(
+            Text("完成 ✔" if last else "下一题 ›", style="bold #33d17a" if last else "bold"))
+        self.query_one("#ask-hint", Static).update(Text(self._hint_text()))
+        lv.index = keep_index
+        lv.focus()
+
+    def _row_text(self, i: int) -> Text:
+        """选项列表第 i 行的内容（i==len(options) 为末尾"其他"行），含单选闪烁"消失"拍的整行留白
+        （行数不变，不跳版）。独立成方法：闪烁节拍只原地 update 选中行的 Static（见 _refresh_row），
+        不整表重建——clear/append 是异步清+挂，0.2s 节拍下两次重建交错会让列表瞬间全空，
+        看起来像所有选项一起闪。"""
+        q, st = self._cur(), self._st()
+        multi = q["multi_select"]
+        opts = q["options"]
+        t = Text()
+        if i >= len(opts):                            # "其他"行
+            picked = (not multi and st["chosen"] == -1)
+            if picked and self._flash_hide:
+                t.append(" ")
+                return t
+            if multi:
+                t.append("[x] " if st["other"] is not None else "[ ] ",
+                         style="bold #33d17a" if st["other"] is not None else "dim")
+            else:
+                t.append("● " if picked else "  ", style="bold #33d17a")
+            t.append("其他（自由输入）" if st["other"] is None else f"其他：{st['other']}",
+                     style="bold #33d17a" if picked else "bold")
+            return t
+        o = opts[i]
+        picked = (not multi and st["chosen"] == i)
+        if picked and self._flash_hide:
+            t.append(" " + ("\n " if o["description"] else ""))
+            return t
+        if multi:
+            t.append("[x] " if i in st["checked"] else "[ ] ",
+                     style="bold #33d17a" if i in st["checked"] else "dim")
+        else:
+            t.append("● " if picked else "  ", style="bold #33d17a")
+        t.append(o["label"], style="bold #33d17a" if picked else "bold")
+        if o["description"]:
+            t.append("\n" + ("    " if multi else "  ") + o["description"], style="dim")
+        return t
+
+    def _refresh_row(self, row: int) -> None:
+        """闪烁节拍：原地更新第 row 行内容（不重建列表，见 _row_text 的注释）。"""
+        lv = self.query_one("#ask-list", ListView)
+        if row < len(lv.children):
+            lv.children[row].query_one(Static).update(self._row_text(row))
+
+    def _hint_text(self) -> str:
+        last = self._idx == len(self._qs) - 1
+        if self._cur()["multi_select"]:
+            return f"Enter 勾选/取消 · → 或点「{'完成' if last else '下一题'}」确认提交 · Esc 跳过提问"
+        if last:
+            return "↑↓ 选 · Enter 选中 · → 或点「完成」提交 · Esc 跳过提问"
+        return "↑↓ 选 · Enter 确认 · ←→ 上/下一题 · Esc 跳过提问"
+
+    # ---- 作答状态 ----
+
+    def _answer_of(self, i: int):
+        """第 i 题当前作答（None=未答）：单选=label 或 "其他：文本"；多选=label 列表。"""
+        q, st = self._qs[i], self._state[i]
+        if q["multi_select"]:
+            labels = [q["options"][j]["label"] for j in sorted(st["checked"])]
+            if st["other"] is not None:
+                labels.append(f"其他：{st['other']}")
+            return labels or None
+        if st["chosen"] is None:
+            return None
+        return f"其他：{st['other']}" if st["chosen"] == -1 else q["options"][st["chosen"]]["label"]
+
+    def _finish(self) -> None:
+        """收卷：逐题已答进 answers、未答进 skipped（Esc 提前收卷时可能非连续）。"""
+        if self._done:
+            return
+        self._done = True
+        self._cancel_timer()
+        answers, skipped = {}, []
+        for i, q in enumerate(self._qs):
+            a = self._answer_of(i)
+            if a is None:
+                skipped.append(q["question"])
+            else:
+                answers[q["question"]] = a
+        self.dismiss({"answers": answers, "skipped": skipped})
+
+    # ---- 导航 ----
+
+    def _cancel_timer(self) -> None:
+        if self._adv_timer is not None:
+            self._adv_timer.stop()
+            self._adv_timer = None
+        self._flash_hide = False
+
+    def _advance(self) -> None:
+        self._cancel_timer()
+        if self._idx >= len(self._qs) - 1:
+            self._finish()
+        else:
+            self._idx += 1
+            self._show()
+
+    def _arm_auto_advance(self) -> None:
+        """单选选中后的视觉反馈：选中行消失-出现闪烁两次（每拍 0.2s，共约 1 秒）再自动推进——
+        闪烁期间可换选/导航，随时取消重来。"""
+        self._cancel_timer()
+        armed = self._idx
+        chosen = self._st()["chosen"]
+        row = len(self._cur()["options"]) if chosen == -1 else chosen
+        seq = [True, False, True, False]          # True=消失拍：隐-现-隐-现 = 闪两次，第 5 拍推进
+
+        def tick() -> None:
+            if self._done or self._idx != armed:
+                return
+            if seq:
+                self._flash_hide = seq.pop(0)
+                self._refresh_row(row)            # 只碰选中行，别整表重建
+            else:
+                self._advance()
+
+        self._adv_timer = self.set_interval(0.2, tick, repeat=5)
+
+    def action_prev_q(self) -> None:
+        if self._done or self._idx == 0:
+            return
+        self._cancel_timer()
+        self._idx -= 1
+        self._show()
+
+    def action_next_q(self) -> None:
+        """下一题/完成：当前题有作答才放行——多选的"提交本题"合并在这（勾了即算答）。"""
+        if self._done:
+            return
+        self._cancel_timer()
+        if self._answer_of(self._idx) is None:
+            self.query_one("#ask-hint", Static).update(
+                Text("请先作答（或 Esc 跳过提问）", style="bold yellow"))
+            return
+        self._advance()
+
+    # ---- 事件 ----
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if self._done:                  # 收卷后队列里迟到的 Selected 全部忽略
+            return
+        q, st = self._cur(), self._st()
+        idx = self.query_one("#ask-list", ListView).index or 0
+        n_opt = len(q["options"])
+        if not q["multi_select"]:
+            if idx < n_opt:                         # 单选：标记选中 → 停留 1 秒自动跳转（换选重计时）
+                st["chosen"], st["other"] = idx, None
+                self._show(keep_index=idx)
+                if self._idx < len(self._qs) - 1:   # 末题不自动收卷：亮选中标，等显式「完成」
+                    self._arm_auto_advance()
+            else:                                   # "其他" → 换出输入框；进"其他"即放弃已选项，
+                self._cancel_timer()                # 避免"● 旧选项 + 输入框"两个作答态并存的歧义
+                st["chosen"], st["other"] = None, None
+                self._show(keep_index=idx)          # 重渲去掉旧选中标记
+                self._show_input()
+            return
+        if idx < n_opt:                             # 多选：Enter 在选项上是勾/去勾
+            st["checked"] ^= {idx}
+            self._show(keep_index=idx)
+        else:                                       # 多选的"其他"：录过再 Enter 是去掉，没录过是去输入
+            if st["other"] is not None:
+                st["other"] = None
+                self._show(keep_index=idx)
+            else:
+                self._show_input()
+
+    def _show_input(self) -> None:
+        inp = self.query_one("#ask-other", AskOtherInput)
+        inp.load_text("")
+        inp.display = True
+        self.query_one("#ask-hint", Static).update(Text("Enter 确认 · Esc 收起返回选项"))
+        inp.focus()
+
+    @on(AskOtherInput.Changed)
+    def _on_other_changed(self, event) -> None:
+        """多选的"其他"随输入实时勾选：框里有字即勾（文本同步进勾选行），删空即去勾——不用等 Enter。"""
+        if self._done or not self._cur()["multi_select"]:
+            return
+        inp = self.query_one("#ask-other", AskOtherInput)
+        if not inp.display:             # _show 复位输入框时的 load_text 也会发 Changed，忽略
+            return
+        self._st()["other"] = inp.text.strip() or None
+        self._refresh_row(len(self._cur()["options"]))
+
+    @on(AskOtherInput.Submitted)
+    def _on_other_submitted(self, event: AskOtherInput.Submitted) -> None:
+        if self._done:                  # 收卷后迟到的提交忽略
+            return
+        st = self._st()
+        if self._cur()["multi_select"]:             # 多选：文本已随输入实时同步（Changed），Enter 只收起回列表
+            self.query_one("#ask-other", AskOtherInput).display = False
+            self._show(keep_index=len(self._cur()["options"]))
+            return
+        text = event.value.strip()
+        if not text:
+            return
+        self.query_one("#ask-other", AskOtherInput).display = False
+        if self._idx < len(self._qs) - 1:           # 单选：显式 Enter 确认，无需停留，直接推进
+            st["chosen"], st["other"] = -1, text
+            self._advance()
+        else:                                       # 单选末题：只落答显示，等显式「完成」收卷
+            st["chosen"], st["other"] = -1, text
+            self._show(keep_index=len(self._cur()["options"]))
+
+    def action_skip(self) -> None:
+        """Esc：输入框开着 → 收起回列表；否则立即收卷（已答带回、未答进 skipped）。"""
+        if self._done:
+            return
+        inp = self.query_one("#ask-other", AskOtherInput)
+        if inp.display:
+            inp.display = False
+            self.query_one("#ask-hint", Static).update(Text(self._hint_text()))
+            self.query_one("#ask-list", ListView).focus()
+            return
+        self._finish()
 
 
 # 模式色（单一色源，渲染细节归 TUI、不进 mode.py）：状态栏按钮底色 + 输入框边框 + 弹窗圆点都用它。
@@ -2189,6 +2565,9 @@ class MecodeApp(App):
         # UI 线程弹窗、用户选完把结果填进 _perm_result 再 set，唤醒 worker。
         self._perm_event = threading.Event()
         self._perm_result = "deny"
+        # 提问跨线程桥（ask_user 工具）：同款机制——worker post AskQuestion + 阻塞等 Event，UI 弹窗回填。
+        self._ask_event = threading.Event()
+        self._ask_result: dict | None = None
         self._mcp_clients = []          # 已连 MCP 客户端（退出时 stop）
         self._mcp_errors = {}           # 没连上的 server → 失败原因（侧栏标红计数、/mcp 面板显详情）
         self._mcp_status = "未接入"
@@ -2225,6 +2604,8 @@ class MecodeApp(App):
                 policy=apply_mode(PermissionPolicy.from_persisted(
                     store.load_permissions(), project_root=store.cwd), self._mode),
                 ask_permission=self._ask_permission)
+        # ask_user 只在 TUI 注册：无头/网关端没有可作答的界面。重复 register 是幂等覆盖，resume 共用同表无碍。
+        self._tool_reg.register(make_ask_user_tool(self._ask_user))
         self._reasoning = ""            # 本轮累积的思考
         # 思考耗时 = reasoning 末片时刻 - 本段思考开始时刻。不能用“首片到末片”：有的模型(kimi)
         # 思考完一次性吐出 reasoning，首末片几乎同时到 → 跨度≈0。要从“开始等模型”算起才对。
@@ -2483,7 +2864,9 @@ class MecodeApp(App):
         self._refresh_mode_indicator()      # 状态栏模式 chip + 输入框边框（默认 normal=蓝）
         self._show_idle_hint()
         self._wire_bg()
-        self.set_interval(0.5, self._sync_bgtasks)    # 常驻刷新后台任务行（含空闲时；更新“已 Ns”、增删行）
+        # 常驻刷新后台任务行（含空闲时；更新“已 Ns”、增删行）。存句柄：ask_user 弹窗期间要暂停
+        # ——它每 0.5s 的重绘帧会把输入法预编辑串顶走（与 spinner 同理）。
+        self._bg_sync_timer = self.set_interval(0.5, self._sync_bgtasks)
         self.query_one("#input", InputArea).focus()
         # 等首帧画完再探测，避免和终端进入 application mode 的初始化序列交叉。
         # 探测只改计宽、不改字符，所以彩色 emoji 原样保留。
@@ -2903,6 +3286,36 @@ class MecodeApp(App):
             self._perm_event.set()
         self.push_screen(PermissionModal(msg.tool, msg.args), done)
 
+    # ---- 提问（ask_user 工具注入的回调，跑在 worker 线程） ----
+
+    def _ask_user(self, questions: list[dict]) -> dict | None:
+        """worker 线程调用：请 UI 弹提问弹窗，阻塞等用户作答。打断中（Ctrl+C）返回 None（按跳过处理）。"""
+        self._ask_event.clear()
+        self.post_message(AskQuestion(questions))
+        while not self._ask_event.wait(0.05):
+            if self.agent._interrupt.is_set():
+                return None
+        return self._ask_result
+
+    @on(AskQuestion)
+    def _on_ask_question(self, msg: AskQuestion) -> None:
+        # 弹窗期间暂停 spinner 帧：10Hz 刷状态栏=终端每 0.1s 重画一帧，每帧都会把输入法的
+        # 预编辑串（拼音预览）顶走/抹掉——表现为拼音在框内与弹窗边缘持续闪烁。主输入框打字时
+        # 轮次空闲无 spinner，故从无此症。状态栏改静态文案，收窗恢复计时动画。
+        if self._work_timer is not None:
+            self._work_timer.pause()
+            self.query_one("#work", Static).update(
+                Text("❓ 等待你在弹窗中作答…   Ctrl+C 打断", style="yellow"))
+        self._bg_sync_timer.pause()
+
+        def done(res: dict | None) -> None:         # 弹窗结果回填 → 唤醒 worker
+            if self._work_timer is not None:
+                self._work_timer.resume()
+            self._bg_sync_timer.resume()
+            self._ask_result = res
+            self._ask_event.set()
+        self.push_screen(QuestionModal(msg.questions), done)
+
     # ---- 续会话（/rl·/resume latest 续最近；/rs·/resume session 开选择器） ----
 
     @staticmethod
@@ -3095,6 +3508,10 @@ class MecodeApp(App):
             # _batch 已 None → 挂进 #log 不进任何批 → 保持可见，绝不被折叠。
             self._turn_busy = False
             self._interrupting = False                # 中断收尾完成，复位（下轮 _set_activity 恢复正常）
+            # 打断可能把审批/提问弹窗留在屏上（worker 已按拒绝/跳过返回，弹窗成孤儿）：收尾时清掉，
+            # 否则后台自动接续的下一轮会压着旧弹窗弹新弹窗，用户答旧窗的结果被错配给新调用。
+            if isinstance(self.screen, (QuestionModal, PermissionModal)):
+                self.screen.dismiss(None)
             self._finalize_batch()
             self._commit_live()
             self.query_one("#input", InputArea).focus()   # 先回焦输入框
