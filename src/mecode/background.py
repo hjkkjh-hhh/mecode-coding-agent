@@ -143,8 +143,11 @@ class BackgroundManager:
             except Exception as e:
                 task.output = f"执行出错：{type(e).__name__}: {e}"
             with self._lock:
-                if task.status == "running":
-                    task.status = "done"
+                # 与 _run_subagent 同款判据（两条守护线程体是孪生路径，改一处必须改另一处）：
+                # 打断标志被置过 = 有人停了它（kill_bgtask 会顺手改 status，而审批弹窗上的
+                # "停止此后台任务"只置标志、不走 kill）→ 不能当自然完成，否则 workflow 那份
+                # 半截汇总会被当最终产物上报给主 agent（用户明明叫停了，主 agent 却以为干完了）。
+                self._mark_finished(task)
             self._finish(task)
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -159,9 +162,25 @@ class BackgroundManager:
         except Exception as e:
             task.output = f"子 agent 执行出错：{type(e).__name__}: {e}"
         with self._lock:
-            if task.status == "running":                 # 没被 kill → 自然完成
-                task.status = "done"
+            self._mark_finished(task)
         self._finish(task)
+
+    def _mark_finished(self, task: BackgroundTask) -> None:
+        """守护线程收尾时定性这个任务（须在 self._lock 内调）。子 agent 与 start_fn（workflow）
+        两条守护线程体【共用它】——它们是孪生路径，此前只给其中一条补了判据，另一条照旧报"自然完成"。
+
+        打断标志被置过 = 有人停了它：kill_bgtask 会顺手把 status 改成 killed，但审批弹窗上的
+        "停止此后台任务"只置标志、不走 kill（它没有任务号）→ 走到这里 status 还是 running。
+        若当自然完成，那半截输出会被当成"总结/汇总报告"上报给主 agent（用户明明叫停了，
+        主 agent 却以为干完了）。"""
+        if task.status != "running":
+            return                                       # 已被 kill 定过性
+        if task.interrupt is not None and task.interrupt.is_set():
+            task.status = "killed"
+            # 记一条便条：否则主 agent 的上下文里那条"#N 运行中"永远悬着、还会去 check 幽灵任务
+            self._killed_notes.append((task.id, task.command, ""))
+        else:
+            task.status = "done"                         # 没被停 → 自然完成
 
     def _run(self, task: BackgroundTask, timeout: int | None) -> None:
         """守护线程体：等命令结束 / 超时；收尾读日志、删文件、走 _finish。被外部 kill 时 status 已是 killed。"""

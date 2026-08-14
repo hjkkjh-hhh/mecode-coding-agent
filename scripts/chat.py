@@ -7,6 +7,7 @@
 【显示】全在这里（render）：agent 只产出事件，怎么显示是调用方（应用层）的事。
 """
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -62,11 +63,34 @@ def render(events) -> str:
     return answer
 
 
-def _ask_permission(tool, args):
-    """工具要执行 ask 类动作时问用户（CLI 版）。返回 once / always / deny。"""
-    print(f"\n{RED}⚠ 工具请求执行：{tool}  {args}{RESET}")
-    ans = input(f"允许？[y]一次 / [a]总是允许 {pattern_for(tool, args)} / [其他]拒绝 > ").strip().lower()
-    return {"y": "once", "a": "always"}.get(ans, "deny")
+# stdin 只有一个，谁都不能和别人同时读它。三方会抢：并发的前台子 agent（各自一个 Agent、共用这个
+# 回调）、后台任务的审批（守护线程里，可能在 REPL 停在"你> "时冒出来）、REPL 自己。不排队的话两段
+# 提示交错打在同一屏，用户敲的一行 y 只被其中一个读到，另一个继续等下一行 —— 谁批了什么全乱。
+# REPL 的 input 也走这把锁（见下方 _read_line）：轮次进行中 REPL 本就不读 stdin，故只在它停在
+# 提示符上时才可能挡住后台审批 —— 那时用户敲一下回车，审批提示随即出现，是可接受的顺序。
+_stdin_lock = threading.Lock()
+
+
+def _read_line(prompt: str) -> str:
+    """REPL 读一行（与审批提示共用 stdin 锁，避免两个 input() 抢同一行输入）。"""
+    with _stdin_lock:
+        return input(prompt)
+
+
+def _ask_permission(tool, args, ctx=None):
+    """工具要执行 ask 类动作时问用户（CLI 版）。返回 once / always / deny。
+    ctx（agent.AskContext）= 谁在问：子 agent 的调用标注出来，让用户知道自己在批哪一层。
+    CLI 的 input() 没法在等待中被打断，故不提供"停止此 agent 分支"（那是 TUI 弹窗的能力）。"""
+    who = "子 agent 请求执行" if getattr(ctx, "is_sub", False) else "工具请求执行"
+    # 该次调用能不能生成有意义的授权规则；生成不了就不提供 [a]（记不住的事别承诺，见 permission.specs_for）
+    root = agent.policy.root if getattr(agent, "policy", None) is not None else None
+    pat = pattern_for(tool, args, root)
+    always = f" / [a]总是允许 {pat}" if pat else ""
+    with _stdin_lock:
+        print(f"\n{RED}⚠ {who}：{tool}  {args}{RESET}")
+        ans = input(f"允许？[y]一次{always} / [其他]拒绝 > ").strip().lower()
+    return {"y": "once", "a": "always"}.get(ans, "deny") if pat else \
+        ("once" if ans == "y" else "deny")
 
 
 def _fmt_time(ts):
@@ -91,7 +115,7 @@ else:                                        # 否则进 REPL
     print("输入问题（exit 退出；/rl 续最近会话；/rs 列会话、/rs N 续第 N 个）")
     while True:
         try:
-            user = input("\n你> ")
+            user = _read_line("\n你> ")
         except (EOFError, KeyboardInterrupt):
             print()
             break

@@ -30,13 +30,15 @@ def test_auto_放行项目内编辑_项目外与bash仍问():
     assert p.decide("bash", {"command": "rm x"}) == "ask"                   # raw bash 不受影响，仍问
 
 
-def test_plan_只读_拒写改跑与子agent():
+def test_plan_只读_拒写改跑_但放行子agent做探索():
     p = apply_mode(_policy(), "plan")
     for tool, args in (("write_file", {"path": "C:/proj/a"}),
                        ("edit_file", {"path": "C:/proj/a"}),
-                       ("bash", {"command": "ls"}),
-                       ("subagent", {"description": "x", "prompt": "y"})):
+                       ("bash", {"command": "ls"})):
         assert p.decide(tool, args) == DENY
+    # 子 agent 曾被一并 deny，理由是"它内部 policy=None 全放、会绕过只读"；现在它继承主 agent 的
+    # policy（见 subagent.py 头），计划模式下同样只能读 → 那条禁令的前提没了，放开它去做探索。
+    assert p.decide("subagent", {"description": "x", "prompt": "y"}) == ALLOW
     assert p.decide("read_file", {"path": "C:/proj/a"}) == ALLOW            # 读仍放行
     assert p.decide("grep", {"path": "C:/proj"}) == ALLOW
     assert p.decide("exit_plan", {"plan": "x"}) == ALLOW                    # 提交计划：计划模式唯一动作，放行

@@ -4,6 +4,7 @@
 没有 bash 就跳过（和 test_tools 的 shell 分支一致）。
 """
 import shutil
+import threading
 import time
 
 import pytest
@@ -225,3 +226,61 @@ def test_完成output是全文_截断交给agent():
     assert _wait(lambda: notified)
     out = bg.drain_completions()[0].output                    # 完成 = 尽量全（内联/外置由 agent 决定）
     assert "STARTMARKER" in out and "ENDMARKER" in out
+
+
+def test_子agent被停止分支后不算自然完成():
+    # 审批弹窗上的"停止此后台任务"只【置打断标志】、不走 kill_bgtask（它没有任务号）。
+    # 若守护线程照旧把 status 置成 done，那半截正文会被当"总结"上报——用户明明是叫停，
+    # 主 agent 却以为它干完了。故：收尾时看打断标志，被停过就记 killed + 留一条便条。
+    class _Runner:
+        def run_for_bg(self, prompt, interrupt, on_slot):
+            interrupt.set()                      # 模拟：跑到一半用户在弹窗上点了"停止此后台任务"
+            return "半截正文，不是总结"
+
+    m = BackgroundManager()
+    tid = m.start_subagent("干活", _Runner(), description="x")
+    assert _wait(lambda: m.running() == [], timeout=8)
+    # _finish 会把任务从在跑表摘掉，故从"完成队列/便条"这两个出口判它被归成了哪一类
+    assert m.drain_completions() == []               # 不当完成上报（否则主 agent 拿半截当结论）
+    assert [n[0] for n in m._killed_notes] == [tid]  # 留便条：否则"#N 运行中"在上下文里永远悬着
+
+
+def test_子agent自然完成仍算done():
+    class _Runner:
+        def run_for_bg(self, prompt, interrupt, on_slot):
+            return "总结"
+
+    m = BackgroundManager()
+    tid = m.start_subagent("干活", _Runner(), description="x")
+    assert _wait(lambda: m.running() == [], timeout=8)
+    done = m.drain_completions()
+    assert [t.id for t in done] == [tid] and done[0].status == "done"
+    assert done[0].output == "总结" and m._killed_notes == []
+
+
+def test_start_fn被停止后不算自然完成():
+    # 与 test_子agent被停止分支后不算自然完成 是【孪生路径】：workflow 走 start_fn、子 agent 走
+    # _run_subagent，两条守护线程体都要按打断标志定性。此前只补了后者，workflow 被停后照旧把
+    # 半截汇总报告当最终产物上报给主 agent（用户明明叫停了，主 agent 却以为干完了）。
+    stop = threading.Event()
+
+    def fake_workflow():
+        stop.set()                            # 模拟：跑到一半用户在审批弹窗上点了"停止此后台任务"
+        return "半截汇总，不是最终产物"
+
+    m = BackgroundManager()
+    tid = m.start_fn(fake_workflow, command="run_workflow（3 个阶段）",
+                     description="wf", interrupt=stop)
+    assert _wait(lambda: m.running() == [], timeout=8)
+    assert m.drain_completions() == []               # 不当完成上报
+    assert [n[0] for n in m._killed_notes] == [tid]  # 留便条，否则"#N 运行中"在上下文里永远悬着
+
+
+def test_start_fn自然完成仍算done():
+    m = BackgroundManager()
+    tid = m.start_fn(lambda: "汇总报告", command="run_workflow", description="wf",
+                     interrupt=threading.Event())
+    assert _wait(lambda: m.running() == [], timeout=8)
+    done = m.drain_completions()
+    assert [t.id for t in done] == [tid] and done[0].status == "done"
+    assert done[0].output == "汇总报告" and m._killed_notes == []

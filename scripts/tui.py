@@ -312,16 +312,35 @@ class AgentEvent(Message):
 
 
 class AskPermission(Message):
-    """worker 线程请求 UI 弹审批弹窗（工具要执行 ask 类动作）。UI 答复经 threading.Event 回传 worker。"""
-    def __init__(self, tool: str, args: dict) -> None:
-        self.tool, self.args = tool, args
+    """worker 线程请求 UI 弹审批弹窗（工具要执行 ask 类动作）。UI 答复经 threading.Event 回传 worker。
+    is_sub=是子 agent 在问（标题用）；can_stop=这条分支可被单独停 → 多给一项"停止此后台任务"。"""
+    def __init__(self, tool: str, args: dict, is_sub: bool = False, can_stop: bool = False,
+                 seq: int = 0) -> None:
+        self.tool, self.args, self.is_sub, self.can_stop = tool, args, is_sub, can_stop
+        self.seq = seq            # 请求序号：迟到的答复据此丢弃（见 App._on_ask_permission.done）
+        super().__init__()
+
+
+class DismissPermission(Message):
+    """worker 被打断、不再等这张审批窗了 → 请 UI 收掉它。
+    不收的话它留在屏上成"幽灵窗"：用户对着它按的那一下会被【下一次】审批当成答复（含"总是允许"落盘）。"""
+    def __init__(self, seq: int) -> None:
+        self.seq = seq
         super().__init__()
 
 
 class AskQuestion(Message):
-    """worker 线程请求 UI 弹提问弹窗（ask_user 工具）。答复经 threading.Event 回传 worker。"""
-    def __init__(self, questions: list[dict]) -> None:
-        self.questions = questions
+    """worker 线程请求 UI 弹提问弹窗（ask_user 工具）。答复经 threading.Event 回传 worker。
+    seq=请求序号，用途同 AskPermission（迟到答复丢弃 / 收窗认这张窗自己的号）。"""
+    def __init__(self, questions: list[dict], seq: int = 0) -> None:
+        self.questions, self.seq = questions, seq
+        super().__init__()
+
+
+class DismissQuestion(Message):
+    """worker 被打断、不再等这张提问窗了 → 请 UI 收掉它（同 DismissPermission）。"""
+    def __init__(self, seq: int) -> None:
+        self.seq = seq
         super().__init__()
 
 
@@ -629,7 +648,10 @@ class _BgStop(Static):
     def on_click(self, event) -> None:
         event.stop()
         # note=True：用户手动停 → 留一条便条，AI 下次跑时知道是被你停的（不自动起轮）。下个 _sync 摘掉本块。
-        self.app.agent._bg.kill(self._bgtask.id, note=True)
+        tid = self._bgtask.id
+        if self.app.agent._bg.kill(tid, note=True) is None:
+            return                                   # 已经结束了（正好抢在这一下之前）→ 别报假回执
+        self.app.notice_killed(tid)
 
 
 class BgTaskRow(Vertical):
@@ -1220,19 +1242,44 @@ class PermissionModal(ModalScreen):
     #perm-list > ListItem { padding: 0 1; }
     """
 
-    def __init__(self, tool: str, args: dict) -> None:
+    def __init__(self, tool: str, args: dict, is_sub: bool = False, root: str | None = None,
+                 can_stop: bool = False) -> None:
         super().__init__()
         self._tool, self._args = tool, args
+        self._is_sub = is_sub                  # 只影响标题（让用户知道在批哪一层）
+        # 文案是"停止此【后台任务】"而不是"停止此 agent 分支"：workflow 各阶段【共用】那个后台任务的
+        # 打断标志（workflow_tools 自己 new 一个 Event 交给 bg.start_fn），停一个 = 停整个 workflow，
+        # 说成"分支"会让人以为只停这一个阶段。而后台子 agent 本身就是一个后台任务 → 两种情形下
+        # "停止此后台任务"都说的是实话。（"一次打断即全部打断"对 workflow 是合理设计，不是缺陷。）
+        # 能被【单独】停掉的（后台/workflow 子 agent）才给这一项：拒这一步之外
+        # 还能停掉整条分支，否则三个选项全是"让它继续跑"，跑偏时只能一次次拒、它一次次换法子再问。
+        # 前台子 agent【不给】——它与主 agent 共享打断标志，那一项会连主 agent 和并发的兄弟一起停。
+        self._can_stop = can_stop
+        # 该次调用能不能生成有意义的授权规则（畸形参数、含元字符的 bash 等生成不了）。
+        # 生成不了就【不给"总是允许"这一项】——记不住的事别承诺，此前那一项点下去要么无效、
+        # 要么记下一条比本次调用更宽的规则。root 用来判"文件夹是否大到不该整片授权"。
+        self._pattern = pattern_for(tool, args, root)
+        # 【选项与返回值出自同一份清单】：(返回值, 显示文案)。此前两处各写各的顺序——compose 里
+        # "停止"排在"拒绝"之前、_choices 里排在最后 → 点"停止此后台任务"只拒了这一步（任务照跑）、
+        # 点"拒绝"反而把整个后台任务停了，两个选项的行为互换。同一份清单就不可能再错位。
+        self._options: list[tuple[str, Text | str]] = [("once", "允许一次")]
+        if self._pattern:
+            self._options.append(("always", f"总是允许 {self._pattern}（记住，不再问）"))
+        self._options.append(("deny", "拒绝"))
+        if can_stop:
+            self._options.append(("stop", Text("停止此后台任务（拒绝并终止它）", style="bold red")))
+
+    @property
+    def _choices(self) -> list[str]:
+        """选项的返回值序列（与屏上列表项一一对应，由 _options 派生）。"""
+        return [c for c, _ in self._options]
 
     def compose(self) -> ComposeResult:
+        title = "⚠ 子 agent 请求执行工具？  " if self._is_sub else "⚠ 允许执行工具？  "
         with Vertical(id="perm"):
-            yield Static(Text.assemble(("⚠ 允许执行工具？  ", "bold yellow"), (self._tool, "bold")))
+            yield Static(Text.assemble((title, "bold yellow"), (self._tool, "bold")))
             yield Static(Text(_summarize_tool(self._tool, self._args), style="dim"), id="perm-sum")
-            yield ListView(
-                ListItem(Static("允许一次")),
-                ListItem(Static(f"总是允许 {pattern_for(self._tool, self._args)}（记住，不再问）")),
-                ListItem(Static("拒绝")),
-                id="perm-list")
+            yield ListView(*(ListItem(Static(label)) for _, label in self._options), id="perm-list")
 
     def on_mount(self) -> None:
         lv = self.query_one("#perm-list", ListView)
@@ -1241,7 +1288,7 @@ class PermissionModal(ModalScreen):
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         idx = self.query_one("#perm-list", ListView).index or 0
-        self.dismiss(("once", "always", "deny")[idx])
+        self.dismiss(self._choices[idx] if idx < len(self._choices) else "deny")
 
     def action_deny(self) -> None:
         self.dismiss("deny")
@@ -2565,6 +2612,17 @@ class MecodeApp(App):
         # UI 线程弹窗、用户选完把结果填进 _perm_result 再 set，唤醒 worker。
         self._perm_event = threading.Event()
         self._perm_result = "deny"
+        # 审批是【一次一个】：前台子 agent 并发跑（各自一个 Agent、共用这一个回调），没有这把锁的话
+        # 两个线程会同时 clear/post，用户答一次把两边一起唤醒、读到同一个结果（串台）。加锁后排队弹。
+        self._perm_lock = threading.Lock()
+        self._perm_seq = 0              # 审批请求序号：被放弃那张窗的迟到答复据此丢弃，不串给下一个等待者
+        self._perm_screen_seq = None    # 【屏上那张窗】的序号。收窗要认它，不能认全局计数器——
+        # worker A 被打断发了 Dismiss(1) 后就放开锁，worker B 立刻把计数器推到 2 再弹新窗；
+        # UI 这时才处理 Dismiss(1)，拿 1 跟 2 比对不上 → 窗 1 收不掉，变成幽灵留在屏上。
+        self._perm_waiting = False      # 有 worker 正等审批窗？轮末清理据此避免误杀（见 ev is None 分支）
+        self._ask_seq = 0               # 同款序号，给 ask_user 那张窗（迟到答复不串给下一次提问）
+        self._ask_screen_seq = None
+        self._ask_waiting = False
         # 提问跨线程桥（ask_user 工具）：同款机制——worker post AskQuestion + 阻塞等 Event，UI 弹窗回填。
         self._ask_event = threading.Event()
         self._ask_result: dict | None = None
@@ -2752,6 +2810,8 @@ class MecodeApp(App):
         if key == "plan" and plan_path:
             reminder += f"\n计划文件（把计划写在这里、用 write_file/edit_file 迭代它）：{plan_path}"
         self.agent.mode_reminder = reminder
+        # 子 agent 版模式段：造子 agent 时拼进它的 system prompt（不含计划文件那句——子 agent 不写计划）
+        self.agent.subagent_reminder = MODES[key].sub_prompt
         self._refresh_mode_indicator()
 
     def _refresh_mode_indicator(self) -> None:
@@ -3270,32 +3330,106 @@ class MecodeApp(App):
 
     # ---- 工具审批（agent 注入的 ask_permission，跑在 worker 线程） ----
 
-    def _ask_permission(self, tool: str, args: dict) -> str:
-        """worker 线程调用：请 UI 弹审批弹窗，阻塞等结果。打断中（Ctrl+C）则直接当拒绝。"""
-        self._perm_event.clear()
-        self.post_message(AskPermission(tool, args))
-        while not self._perm_event.wait(0.05):
-            if self.agent._interrupt.is_set():
+    def notice_killed(self, tid: int | None) -> None:
+        """停掉后台任务后的回执（✕停止按钮 / 审批弹窗的"停止"两处共用）。
+        没有它的话，任务块消失和"它自己跑完了"看起来一模一样，无从确认停止生效没有。
+        走 Notice（batch=False，不被折进工具批）；不起轮——便条等下次因别的原因跑时捎带注入。
+        post_message 是线程安全的，故 worker 线程里也能调。"""
+        self.post_message(AgentEvent(Notice(
+            f"已停止后台任务 #{tid}" if tid is not None else "已停止该后台任务")))
+
+    def _ask_permission(self, tool: str, args: dict, ctx=None) -> str:
+        """worker 线程调用：请 UI 弹审批弹窗，阻塞等结果。
+        ctx（agent.AskContext）= 谁在问：盯【它自己的】打断标志退出——后台子 agent 用的是
+        BackgroundManager 给的独立标志，只盯主 agent 的话 kill_bgtask 解不开卡在弹窗上的线程。
+        并发调用（前台子 agent 批）由 _perm_lock 排队：一次只弹一个，结果不串台。
+        选"停止此后台任务" → 置它的标志（=终止该子 agent）并按拒绝返回。"""
+        ev = getattr(ctx, "interrupt", None) or self.agent._interrupt
+        is_sub = bool(getattr(ctx, "is_sub", False))
+        can_stop = bool(getattr(ctx, "can_stop", False))
+        # 排队等锁也要能被打断：`with self._perm_lock` 是无限阻塞的——一头扎进去就再也看不见打断标志，
+        # 前面那个"已在中断中"的检查只挡得住【进来之前】就被停的。于是 Ctrl+C / kill_bgtask 在
+        # 别人的弹窗被答掉之前完全不生效（用户以为没反应，其实是这条线程卡在锁上）。改成带超时轮询。
+        while not self._perm_lock.acquire(timeout=0.05):
+            if ev.is_set():
                 return "deny"
-        return self._perm_result
+        if ev.is_set():                           # 拿到锁的瞬间又被停了 → 别弹窗，直接放开
+            self._perm_lock.release()
+            return "deny"
+        try:
+            self._perm_event.clear()
+            self._perm_seq += 1
+            seq = self._perm_seq
+            self._perm_waiting = True             # 告诉轮末清理：这张窗有人等着，别收
+            self.post_message(AskPermission(tool, args, is_sub, can_stop, seq))
+            while not self._perm_event.wait(0.05):
+                if ev.is_set():                   # 被 Ctrl+C / kill_bgtask 停掉 → 当拒绝，放开线程
+                    self.post_message(DismissPermission(seq))   # 顺手收窗，别留幽灵窗在屏上
+                    return "deny"
+            if self._perm_result == "stop":
+                ev.set()                          # 终止这条 agent 分支（它在下一个检查点停）
+                # 认 id 靠"它的打断标志就是这个 ev"（workflow 各阶段共用一个 → 认到那个后台任务，正确）
+                self.notice_killed(next((t.id for t in self.agent._bg.running()
+                                         if t.interrupt is ev), None))
+                return "deny"
+            return self._perm_result
+        finally:
+            self._perm_waiting = False
+            self._perm_lock.release()
 
     @on(AskPermission)
     def _on_ask_permission(self, msg: AskPermission) -> None:
         def done(choice: str | None) -> None:       # 弹窗结果回填 → 唤醒 worker
+            if self._perm_screen_seq == msg.seq:
+                self._perm_screen_seq = None        # 这张窗谢幕了，屏上不再是它
+            if msg.seq != self._perm_seq:           # 迟到的答复：这张窗早被放弃（打断/收尾）→ 丢弃，
+                return                              # 否则会被【下一次】审批当成答复（含"总是允许"落盘）
             self._perm_result = choice or "deny"
             self._perm_event.set()
-        self.push_screen(PermissionModal(msg.tool, msg.args), done)
+        root = self.agent.policy.root if self.agent.policy is not None else None
+        self._perm_screen_seq = msg.seq            # 记住【屏上这张】是谁，收窗时认它（见 _on_dismiss_permission）
+        self.push_screen(PermissionModal(msg.tool, msg.args, msg.is_sub, root, msg.can_stop), done)
+
+    def _clear_orphan_modal(self) -> bool:
+        """轮收尾清【孤儿】弹窗：打断会把审批/提问窗留在屏上（worker 已按拒绝/跳过返回、没人再等它），
+        不清的话后台自动接续的下一轮会压着旧窗弹新窗，用户答旧窗的结果被错配给新调用。
+
+        但【有人正等的窗不能动】：后台子 agent / workflow 阶段跑在自己的线程里，与主 agent 这一轮
+        各自独立——主 agent 收尾时它们可能刚弹窗等你答，无条件 dismiss 会让用户【没答】就被判成
+        "用户拒绝"，还写进它的工具结果上报给主 agent。返回是否真的清了（供测试断言）。"""
+        if self._perm_waiting or self._ask_waiting:
+            return False
+        if isinstance(self.screen, (QuestionModal, PermissionModal)):
+            self.screen.dismiss(None)
+            return True
+        return False
+
+    @on(DismissPermission)
+    def _on_dismiss_permission(self, msg: DismissPermission) -> None:
+        """收掉一张没人再等的审批窗（worker 被打断时请求）。
+        认【这张窗自己的序号】，不是全局计数器：worker A 发完收窗请求就放开锁，worker B 会立刻把
+        计数器推到下一个再弹新窗，等 UI 处理到这条时拿旧序号跟新计数器比必然对不上 → 窗收不掉、
+        成了压在新窗底下的幽灵。"""
+        if msg.seq == self._perm_screen_seq and isinstance(self.screen, PermissionModal):
+            self.screen.dismiss(None)
 
     # ---- 提问（ask_user 工具注入的回调，跑在 worker 线程） ----
 
     def _ask_user(self, questions: list[dict]) -> dict | None:
         """worker 线程调用：请 UI 弹提问弹窗，阻塞等用户作答。打断中（Ctrl+C）返回 None（按跳过处理）。"""
         self._ask_event.clear()
-        self.post_message(AskQuestion(questions))
-        while not self._ask_event.wait(0.05):
-            if self.agent._interrupt.is_set():
-                return None
-        return self._ask_result
+        self._ask_seq += 1                        # 同审批那套：被放弃那张窗的迟到答复据此丢弃
+        seq = self._ask_seq
+        self._ask_waiting = True                  # 同审批：告诉轮末清理这张窗有人等着，别收
+        try:
+            self.post_message(AskQuestion(questions, seq))
+            while not self._ask_event.wait(0.05):
+                if self.agent._interrupt.is_set():
+                    self.post_message(DismissQuestion(seq))   # 顺手收窗，别留幽灵窗在屏上
+                    return None
+            return self._ask_result
+        finally:
+            self._ask_waiting = False
 
     @on(AskQuestion)
     def _on_ask_question(self, msg: AskQuestion) -> None:
@@ -3312,9 +3446,20 @@ class MecodeApp(App):
             if self._work_timer is not None:
                 self._work_timer.resume()
             self._bg_sync_timer.resume()
+            if self._ask_screen_seq == msg.seq:
+                self._ask_screen_seq = None         # 这张窗谢幕了
+            if msg.seq != self._ask_seq:            # 迟到的答复：这张窗早被放弃（打断）→ 丢弃，
+                return                              # 否则问 A 的答案会被记到【下一次提问】头上
             self._ask_result = res
             self._ask_event.set()
+        self._ask_screen_seq = msg.seq
         self.push_screen(QuestionModal(msg.questions), done)
+
+    @on(DismissQuestion)
+    def _on_dismiss_question(self, msg: DismissQuestion) -> None:
+        """收掉一张没人再等的提问窗（同 _on_dismiss_permission，认这张窗自己的序号）。"""
+        if msg.seq == self._ask_screen_seq and isinstance(self.screen, QuestionModal):
+            self.screen.dismiss(None)
 
     # ---- 续会话（/rl·/resume latest 续最近；/rs·/resume session 开选择器） ----
 
@@ -3508,10 +3653,7 @@ class MecodeApp(App):
             # _batch 已 None → 挂进 #log 不进任何批 → 保持可见，绝不被折叠。
             self._turn_busy = False
             self._interrupting = False                # 中断收尾完成，复位（下轮 _set_activity 恢复正常）
-            # 打断可能把审批/提问弹窗留在屏上（worker 已按拒绝/跳过返回，弹窗成孤儿）：收尾时清掉，
-            # 否则后台自动接续的下一轮会压着旧弹窗弹新弹窗，用户答旧窗的结果被错配给新调用。
-            if isinstance(self.screen, (QuestionModal, PermissionModal)):
-                self.screen.dismiss(None)
+            self._clear_orphan_modal()
             self._finalize_batch()
             self._commit_live()
             self.query_one("#input", InputArea).focus()   # 先回焦输入框

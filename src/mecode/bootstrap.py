@@ -12,7 +12,9 @@
     auto    【默认】项目内 write/edit 自动放行，其余照旧——能干活又不出圈
     yolo    全放行（慎用；给完全信任的自动化场景）
     plan    不支持——计划要人批，无头场景无意义（要交互请用 TUI）
-要交互审批：传 ask_permission 回调（(tool, args) -> "once"/"always"/"deny"，同 chat.py 的约定）。
+要交互审批：传 ask_permission 回调（(tool, args, ctx) -> "once"/"always"/"deny"，同 chat.py 的约定；
+ctx 是 agent.AskContext，带【提问方自己的】打断标志与"是不是子 agent"，UI 据它决定盯谁的中断、
+要不要给"停止此后台任务"）。
 
 工具的相对路径（bash 工作目录、grep/glob 默认根）解析自【进程工作目录】——cwd 参数管的是
 会话归属 / 权限项目根 / MCP ${cwd}；跨目录使用请调用方自行 os.chdir 或让模型用绝对路径。
@@ -87,5 +89,6 @@ def build_agent(cwd: str | Path | None = None, *, mode: str = "auto",
                   ask_permission=ask_permission)
     agent.mode = mode
     agent.mode_reminder = MODES[mode].prompt      # 模式段每轮注入（不进 system prompt，同 TUI 约定）
+    agent.subagent_reminder = MODES[mode].sub_prompt   # 同模式的子 agent 版说法（造子 agent 时拼进它的 system）
     agent.mcp_clients = mcp_clients               # 暴露给调用方显式 stop；registry 复用时为空（归首建者管）
     return agent

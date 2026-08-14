@@ -6,7 +6,17 @@
 v1（同步·推式）：任务写在 prompt 里 → 造干净 Agent 跑到出最终文本 → 返回当工具结果。顺序、阻塞
 （一轮里多个 subagent 会顺序跑，不并行——并行留到 v3 复用 bg）。
 工具集 = core（read/write/edit/bash/grep/glob），【不含 subagent/bg/task】（防无限递归、保持精简）。
-权限 = 全放行（policy=None）：子 agent 无用户可答"ask"，主 agent 既决定派活即信任它（选项 a）。
+权限 = 【继承主 agent 当前策略】（含模式覆盖）：心智模型是"子 agent 的权限 = 你当前模式的权限"，
+  换个说法逃不掉。此前是 policy=None 全放行，理由写的是"主 agent 既决定派活即信任"——但主 agent
+  本身就是被这道闸管的对象，用被审查者的判断豁免审查是循环论证；实测 normal 模式下 `rm -rf` 要审批、
+  包成 subagent 就不用，是整个权限系统的绕过口（计划模式早已因此把 subagent 一并 deny，等于自认）。
+  ask 回调也继承（前台后台都能问）：曾试过"后台不给回调、ask 一律自动拒"，实测代价太大——normal/auto
+  模式下 workflow 的每个阶段与后台子 agent 的写动作、非白名单命令会被【静默】拒掉，阶段还标成 ✓ 成功，
+  等于 workflow 只在 YOLO 下能干活。改为都能问；后台任务弹审批窗时，窗上多一项"停止此后台任务"
+  （置它自己的打断标志 → 拒这一步 + 停整条分支），审批循环也盯【提问方自己的】标志，故 kill_bgtask
+  能把卡在弹窗上的后台子 agent 解开（见 agent.AskContext）。无头（主 agent 的 ask_permission 本就是
+  None）时自然继承 None → 自动拒绝，文案说明是"没有可审批的用户"而非谎称"用户拒绝"。
+  注：子 agent 里选"总是允许"只在本进程生效（它 store=None、不落 permissions.json），主 agent 侧照常持久化。
 打断 = 与主 agent 共享同一个 interrupt Event：Ctrl+C 能连带停子 agent（在其下一个检查点，v1 不即时杀其 bash）。
 """
 from __future__ import annotations
@@ -39,26 +49,51 @@ class SubagentRunner:
     """派生子 agent 跑子任务、回总结。持有造子 agent 需要的依赖（provider / config / 前台共享打断标志）。
     两种入口：run（前台，共享主 agent 打断→Ctrl+C 连带停）/ run_for_bg（后台，自带独立打断、暴露 proc_slot 供 kill）。"""
 
-    def __init__(self, provider, config, interrupt: threading.Event | None = None) -> None:
+    def __init__(self, provider, config, interrupt: threading.Event | None = None,
+                 owner=None) -> None:
         self.provider = provider          # 和主 agent 同一个 provider（同后端）
         self.config = config
         self.interrupt = interrupt        # 前台：与主 agent 共享打断标志（Ctrl+C 连带停）
+        # 派它的主 agent：造子 agent 时【实时】读它的 policy/ask_permission（不存快照——切模式会整个
+        # 换掉 agent.policy，快照会变陈旧）。None（直接构造 runner 的老用法/测试）→ policy=None 全放行。
+        self.owner = owner
         # 当前在跑的【前台】子 agent 的 proc_slot（run 期间登记、跑完注销）。共享打断标志只让子 agent 在
         # 【检查点】停，但它若正卡在长 bash 的 communicate 里收不到——故 Ctrl+C 时主 agent 还要 kill_active
         # 把这些 bash 当场树杀，让 communicate 立即返回、子 agent 到检查点即停（否则并发批会卡到最慢的 bash 跑完）。
         self._active_slots: set = set()
         self._slots_lock = threading.Lock()
 
-    def _make(self, interrupt: threading.Event | None):
+    def _make(self, interrupt: threading.Event | None, *, own_branch: bool = False):
+        """造一个子 agent：权限与审批回调都继承主 agent（见模块头）。前台后台一视同仁——
+        区别只在打断标志：前台与主 agent【共享】（Ctrl+C 连带停，但也意味着停它=停整轮），
+        后台/workflow 自带独立的。own_branch 就是这个区别，审批弹窗据它决定给不给
+        "停止此后台任务"（对前台给了是骗人的，见 agent.AskContext.can_stop）。"""
         from .agent import Agent          # 延迟导入：避免与 agent.py 循环
+        reg = default_registry()          # 干净的 core 工具集（read/write/edit/bash/grep/glob）
+        # exit_plan 是"把计划交给用户审阅"——子 agent 没有用户可提交，它的交付物就是那段总结。
+        # 留着它，模型一调就会把自己那一轮提前结束且不出总结（计划模式放开子 agent 后正好踩得到）。
+        reg.unregister("exit_plan")
+        # 模式段（子 agent 版）：主 agent 那段是写给"要产出计划文件、调 exit_plan"的角色看的，照搬有害；
+        # 这里注入的是同一模式下【给子 agent 的】说法（如计划模式=只读，别反复重试被拒的动作）。
+        prompt = SUBAGENT_PROMPT + (getattr(self.owner, "subagent_reminder", "") or "")
         return Agent(
-            self.provider, default_registry(),   # 干净的 core 工具集（read/write/edit/bash/grep/glob）
-            system_prompt=SUBAGENT_PROMPT,
+            self.provider, reg,
+            system_prompt=prompt,
             config=self.config,
             store=None,                   # 不落子会话盘（只回总结；主 transcript 记 spawn 调用+总结）
-            policy=None,                  # 全放行（选项 a）：无用户可答 ask，既派活即信任
+            # 权限与审批回调都继承主 agent（见模块头）：换个说法（包成子 agent）不该绕过闸。
+            # 【共用同一个 policy 对象，不 fork】：用户点"总是允许"批的是【这个操作】本身，与"是哪个
+            # agent 在问"无关 —— 它就该全局生效。曾经改成 fork（各拿副本）以防"授权外溢到父"，
+            # 但那让同一个授权在每个阶段/每个兄弟子 agent 里都要重问一遍，且与弹窗承诺的
+            # "记住，不再问"相悖。真正该配套的是【让它落盘】（见下面 persist_permission）。
+            policy=getattr(self.owner, "policy", None),
+            ask_permission=getattr(self.owner, "ask_permission", None),
+            # 子 agent 自己 store=None → 借主 agent 的落盘出口，让它里面点的"总是允许"也进
+            # permissions.json（跨会话、且切模式重建 policy 后依然在）。
+            persist_permission=getattr(self.owner, "_persist_perm", None),
             subagent=True,                # 不注册 subagent/bg/task 工具（防递归、保持精简）
             interrupt=interrupt,
+            own_branch=own_branch,
         )
 
     def run(self, prompt: str) -> str:
@@ -87,8 +122,10 @@ class SubagentRunner:
 
     def run_for_bg(self, prompt: str, interrupt: threading.Event, on_slot) -> str:
         """后台：用【自带的独立打断标志】造子 agent（Ctrl+C 不碰它，只 kill 停），把它的 ProcSlot 经 on_slot
-        交给管理器（供 kill 杀它正跑的前台 bash 及后代）；跑到完成、回总结。"""
-        sub = self._make(interrupt)
+        交给管理器（供 kill 杀它正跑的前台 bash 及后代）；跑到完成、回总结。
+        它需审批时照常弹窗（窗上带"停止此后台任务"）；kill 置的就是这里的 interrupt，
+        审批循环盯着它 → 卡在弹窗上也能被 kill 解开。"""
+        sub = self._make(interrupt, own_branch=True)   # 自带独立打断标志 → 可被单独停
         on_slot(sub._proc_slot)           # 交出 proc_slot：kill 时置打断 + 杀这条 bash（树杀→含孙进程）
         list(sub.run_turn(prompt))
         return _last_assistant_text(sub)

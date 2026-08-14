@@ -102,7 +102,7 @@ def test_agent_调save_memory_默认放行不审批且真写入(tmp_path):
 
     asked = []
     a = Agent(P(), reg, system_prompt="x",
-              policy=PermissionPolicy(), ask_permission=lambda n, ar: asked.append(n) or "deny")
+              policy=PermissionPolicy(), ask_permission=lambda n, ar, ctx=None: asked.append(n) or "deny")
     list(a.run_turn("记住我"))
     assert asked == []                                       # save_memory 默认放行，没弹审批
     assert "用户画像内容" in recall_memory(tmp_path, "u")    # 真写进了记忆

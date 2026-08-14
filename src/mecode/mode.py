@@ -20,6 +20,7 @@ class Mode:
     label: str                        # 显示名（状态栏 chip 文本）
     desc: str = ""                    # 一句话简介（模式选择弹窗里给用户看；是语义内容、非渲染）
     prompt: str = ""                  # 注入 system prompt 的模式段（空=不注入）
+    sub_prompt: str = ""              # 同模式下【给子 agent 的】说法（见下方各常量；空=不注入）
     overlay: dict = field(default_factory=dict)   # 叠到 policy 的规则：{工具: {"allow"/"deny": [spec]}}
     default: str | None = None        # 覆盖 policy.default（yolo=allow）；None=保持不变
 
@@ -27,7 +28,8 @@ class Mode:
 # —— 各模式提示词段：auto/plan/yolo 的正文随各自模式落地时再填；normal 无段 ——
 AUTO_PROMPT = ""
 PLAN_PROMPT = (
-    "当前是计划模式（只读）：先探索、弄清现状，别改任何【项目文件】、别跑改动性命令、别派子 agent。"
+    "当前是计划模式（只读）：先探索、弄清现状，别改任何【项目文件】、别跑改动性命令。"
+    "要摸清一大片代码时可以派子 agent 去调研——它同样只能读，回来给你一段总结。"
     "把你的完整实施计划【写进下面给出的计划文件】——首次用 write_file 写全量计划，之后按用户意见用 edit_file "
     "增量修改它（别每次全量重写）。计划要讲清目标、涉及哪些文件、分几步做、关键取舍。"
     "计划就绪后调用 exit_plan（无参数）提交给用户审阅，然后停下等批准或修改意见。"
@@ -39,9 +41,23 @@ YOLO_PROMPT = (
     "在执行之前必须先停下来告诉用户你想做什么、风险在哪，请其确认，用户批准后再执行。"
 )
 
+# —— 子 agent 版模式段（由 SubagentRunner 拼到 SUBAGENT_PROMPT 后）——
+# 为什么不复用上面那几段：主 agent 版是写给"要产出计划文件、调 exit_plan 提交用户审阅"的角色看的，
+# 而子 agent 没有用户、也没有 exit_plan 工具，照搬会让它去写计划文件、调一个不存在的工具。
+PLAN_SUB_PROMPT = (
+    "\n- 当前处于【只读】状态：写文件 / 改文件 / 跑命令都会被拒绝，你只能靠读取、搜索、浏览完成调研。"
+    "被拒的动作别反复重试，把查清的事实与结论写进总结即可（主 agent 要拿它去写实施计划）。"
+)
+YOLO_SUB_PROMPT = (
+    "\n- 当前所有工具调用都会自动执行、不再确认：凡不可逆的破坏性动作（删库 / rm -rf、覆盖重要文件、"
+    "对外发送数据）你自己别做，把它写进总结交给主 agent 定夺。"
+)
+
 _WRITE = ("write_file", "edit_file")
-# 计划模式只读：写/改/跑命令全禁；连派生子 agent 也禁——子 agent 内部 policy=None 全放，会绕过只读。
-_PLAN_DENY = ("write_file", "edit_file", "bash", "subagent")
+# 计划模式只读：写/改/跑命令全禁。子 agent 【不】在禁用之列——它此前被一并禁掉，理由是"子 agent 内部
+# policy=None 全放，会绕过只读"；现在子 agent 继承主 agent 的 policy（见 subagent.py 头），在计划模式下
+# 它同样只能读，绕不过去 → 那条禁令的前提没了，放开它去做探索（正是计划模式最需要的活）。
+_PLAN_DENY = ("write_file", "edit_file", "bash")
 
 NORMAL = Mode("normal", "普通", "需要审核的改动和命令执行前都需手动批准")            # 空叠加 + 空段 = 现状（default=ask）
 # auto：自动放行【项目内】的结构化编辑（write/edit）。@root 由 apply_mode 用 policy.root 展开成项目根；
@@ -49,9 +65,10 @@ NORMAL = Mode("normal", "普通", "需要审核的改动和命令执行前都需
 AUTO = Mode("auto", "自动", "改动项目内文件自动批准；其他工具仍会询问",
             prompt=AUTO_PROMPT, overlay={t: {ALLOW: ["@root", "@root/**"]} for t in _WRITE})
 PLAN = Mode("plan", "计划", "先探索并给出完整计划，批准后再动手",
-            prompt=PLAN_PROMPT, overlay={t: {DENY: ["*"]} for t in _PLAN_DENY})   # 只读
+            prompt=PLAN_PROMPT, sub_prompt=PLAN_SUB_PROMPT,
+            overlay={t: {DENY: ["*"]} for t in _PLAN_DENY})              # 只读
 YOLO = Mode("yolo", "YOLO", "所有工具自动批准、不再询问（慎用）",
-            prompt=YOLO_PROMPT, default=ALLOW)                           # 全放行
+            prompt=YOLO_PROMPT, sub_prompt=YOLO_SUB_PROMPT, default=ALLOW)   # 全放行
 
 MODES: dict[str, Mode] = {m.key: m for m in (NORMAL, AUTO, PLAN, YOLO)}
 DEFAULT_MODE = "normal"

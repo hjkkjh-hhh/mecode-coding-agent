@@ -616,6 +616,10 @@ def _glob(args: dict) -> str:
     base = Path(args.get("path", "."))
     if not base.is_dir():
         return f"错误：目录不存在 {base}"
+    # `..` 一律拒：它是 pattern 爬出 path 的唯一出路（绝对 pattern 被 pathlib 自己拒掉、~ 不展开），
+    # 权限闸同样按这条判（permission._glob_escapes），两边同源。要搜别处就把 path 指过去。
+    if any(".." in p.replace("\\", "/").split("/") for p in _expand_braces(pattern)):
+        return "错误：pattern 里不能用 ..（要搜别的目录请改 path 参数）"
     limit = int(args.get("head_limit", GLOB_MAX_RESULTS))
     seen: set[Path] = set()
     matches: list[Path] = []

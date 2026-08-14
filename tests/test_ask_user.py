@@ -131,3 +131,49 @@ def test_TUI渲染_畸形参数不抛异常():
     for args in malformed:
         assert isinstance(tui._summarize_tool("ask_user", args), str)
         assert isinstance(tui._tool_input_text("ask_user", args), str)
+
+
+def test_提问桥的迟到答复不串给下一次提问():
+    """与审批弹窗同款竞态：worker 被打断后放弃了那张提问窗，用户随后才作答 → 结果必须丢弃，
+    否则【问 A 的答案会被记到下一次提问头上】（模型据此做决定，比审批串台更隐蔽）。
+    收窗同样要认【那张窗自己的序号】，不是全局计数器。"""
+    import threading
+
+    App = type("App", (tui.MecodeApp,), {"screen": None})   # screen 是只读属性 → 子类降级
+    app = App.__new__(App)
+    app._ask_seq = 0
+    app._ask_screen_seq = None
+    app._ask_result = None
+    app._ask_waiting = False
+    app._ask_event = threading.Event()
+    app._work_timer = None
+    app._bg_sync_timer = type("T", (), {"pause": lambda s: None, "resume": lambda s: None})()
+    posted = []
+    app.post_message = posted.append
+    app.agent = type("A", (), {"_interrupt": threading.Event()})()
+    app.query_one = lambda *a, **k: type("W", (), {"update": lambda s, x: None})()
+
+    app.agent._interrupt.set()                              # 已在打断中 → 等待循环立刻早退
+    assert app._ask_user([{"question": "选哪个？", "options": [], "multi_select": False}]) is None
+    assert app._ask_waiting is False
+    assert [type(m).__name__ for m in posted] == ["AskQuestion", "DismissQuestion"]
+    ask1, dismiss1 = posted
+
+    captured = {}
+    app.push_screen = lambda screen, cb: captured.setdefault("done", cb)
+    app._on_ask_question(ask1)
+    assert app._ask_screen_seq == ask1.seq
+
+    # 竞态：下一次提问已经开始（全局序号推进），此时才处理上一张的收窗请求 → 认窗自己的号，照样收得掉
+    app._ask_seq = ask1.seq + 1
+    dismissed = []
+    app.screen = type("S", (tui.QuestionModal,),
+                      {"dismiss": lambda self, r: dismissed.append(r)})([])
+    app._on_dismiss_question(dismiss1)
+    assert dismissed == [None]
+
+    # 用户这才去点那张被放弃的窗 → 答复丢弃，不唤醒下一个等待者、也不写进结果
+    app._ask_event.clear()
+    captured["done"]({"answers": {"选哪个？": "A"}, "skipped": []})
+    assert not app._ask_event.is_set()
+    assert app._ask_result is None

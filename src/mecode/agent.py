@@ -38,7 +38,31 @@ MAX_PARALLEL_READS = 8       # 连续只读工具组的并发上限（一批几�
 # 拒绝执行的统一文案（明确叫停，否则模型常换命令/工具反复重试、刷屏空转）
 _DENY_TOOL = ("错误：用户拒绝执行工具 {name}。不要重试或换工具绕过该操作；"
               "直接简短告诉用户你想做什么、为何需要，然后停下等用户指示。")
+# 无人可审批（无头模式：ask_permission=None）时【不能】说"用户拒绝"——用户根本没被问过，那是假信息，
+# 模型会照此向上汇报。如实讲明是环境所限，并让它把没做成的事写清楚。
+_DENY_NO_APPROVER = ("错误：工具 {name} 需要用户授权，但当前环境没有可审批的用户，已自动拒绝。"
+                     "不要重试或换工具绕过；跳过该动作继续能做的部分，并在最终回复里写明"
+                     "哪些步骤因未获授权而没有执行。")
 _DENY_SUBAGENT = "错误：用户拒绝派生子 agent。直接告诉用户你想做什么、为何需要，然后停下。"
+
+
+class AskContext:
+    """交给审批回调的上下文：让 UI 知道【是谁在问】。
+
+    interrupt = 提问方 agent 【正在用的】那个打断标志。审批循环盯它 → 该 agent 被停掉时（Ctrl+C 或
+      kill_bgtask），卡在弹窗上的线程能立刻解开。此前循环写死盯主 agent 的标志，而后台子 agent 用的是
+      BackgroundManager 给的另一个 Event → kill_bgtask 解不开它。
+    is_sub = 提问方是不是子 agent（弹窗标题用，让用户知道自己在批哪一层）。
+    can_stop = 这个 agent 是不是【跑在一个可单独停掉的后台任务里】——决定弹窗要不要给"停止此后台任务"。
+      注意它不等于 is_sub：**前台子 agent 与主 agent 共享同一个 interrupt**（SubagentRunner 把
+      主 agent 的 _interrupt 直接传给它），置它等于按 Ctrl+C 停掉整轮、连并发的兄弟子 agent 一起停 ——
+      那一项对前台是骗人的。只有后台/workflow 子 agent 自带独立 Event，停它才真的只停这一条。"""
+    __slots__ = ("interrupt", "is_sub", "can_stop")
+
+    def __init__(self, interrupt: threading.Event, is_sub: bool, can_stop: bool = False) -> None:
+        self.interrupt = interrupt
+        self.is_sub = is_sub
+        self.can_stop = can_stop
 
 
 class _TurnInterrupted(Exception):
@@ -55,13 +79,22 @@ class Agent:
                  policy: PermissionPolicy | None = None,
                  ask_permission: Callable[[str, dict], str] | None = None,
                  subagent: bool = False,
-                 interrupt: threading.Event | None = None) -> None:
+                 interrupt: threading.Event | None = None,
+                 own_branch: bool = False,
+                 persist_permission: "Callable[[str, str, str], None] | None" = None) -> None:
         self.provider = provider
         self.tools = tools
         # 运行行为配置（防跑飞/上下文上限/压缩阈值/保留轮数）；frozen dataclass，作默认值共享也安全
         self.config = config
         # 会话存储（注入；None=不落盘，旧行为/测试用）。单一真相：管 transcript.jsonl + 工具外置
         self.store = store
+        # "总是允许"的落盘出口（窄回调，同 ask_permission 的注入套路）。默认写自己的 store；
+        # 子 agent 的 store 是 None（它不落子会话盘），由 SubagentRunner 把【主 agent 的】这个回调
+        # 传给它 —— 否则子 agent 里点的"总是允许"进不了 permissions.json：弹窗承诺"记住，不再问"，
+        # 实际却是切一次模式（policy 从盘上重建）就凭空消失。
+        self._persist_perm: Callable[[str, str, str], None] = (
+            persist_permission or (store.add_permission if store is not None
+                                   else (lambda tool, decision, spec: None)))
         # 工具权限（注入；None=不设闸、全放，旧行为/测试用）。policy 判 allow/deny/ask；
         # ask 时调 ask_permission 问用户（消费端注入 once/always/deny）。
         self.policy = policy
@@ -71,6 +104,10 @@ class Agent:
         # 当前模式的每轮提示词（plan/yolo 有，normal/auto 空）。由消费端（TUI）按模式设；_pre_turn 每轮把它
         # 作为 user+<system-reminder> 注入到最新消息处——【不进 system prompt】，保持前缀稳定、不击穿 prompt 缓存。
         self.mode_reminder = ""
+        # 同模式下【给子 agent 的】说法（Mode.sub_prompt）：SubagentRunner 造子 agent 时拼进它的
+        # system prompt。与 mode_reminder 分开存——主 agent 那段是写给"要产出计划文件、调 exit_plan"
+        # 的角色看的，照搬给子 agent 有害（见 mode.PLAN_SUB_PROMPT 的注释）。
+        self.subagent_reminder = ""
         self._pending_reminder = ""   # 一次性 <system-reminder>（消费端设，如批准计划时的执行提示）：下一轮开头注入一次即清，不显示成用户消息
         self._plan_pending = False    # 本轮是否已 exit_plan 提交计划 → 执行完工具就结束本轮、等用户审阅
         # 自带翻页的"read 类"工具名：其超长输出不外置（模型本就能用 offset/limit 翻，外置反绕圈）
@@ -94,6 +131,10 @@ class Agent:
         # 若放它起后台 bash，那条 daemon 线程+子进程在子 agent 结束/被 kill 时无人 reap，会僵尸泄漏。
         # 故子 agent 执行 bash 时传 bg=None（见 _exec_tool），background:true 会被 _bash 显式拒绝。
         self._is_subagent = subagent
+        # 这条 agent 分支能不能被【单独】停掉 = 它是否持有自己独立的打断标志。
+        # 前台子 agent 与主 agent 共享标志（停它=停整轮）→ False；后台/workflow 子 agent 自带 → True。
+        # 只用于审批弹窗要不要给"停止此后台任务"（见 AskContext.can_stop）。
+        self._own_branch = own_branch
         self._subagent = None
         self._workflow = WorkflowRun()                # workflow 执行状态（TUI 轮询画分支树；空闲时 stages 为空）
         if not subagent:
@@ -101,7 +142,8 @@ class Agent:
                 tools.register(t)
             for t in task_tools(self._tasks):         # task_create / update / get / list
                 tools.register(t)
-            self._subagent = SubagentRunner(provider, config, interrupt=self._interrupt)
+            # owner=self：子 agent 造出来时实时读主 agent 的 policy/ask_permission（权限继承，见 subagent.py 头）
+            self._subagent = SubagentRunner(provider, config, interrupt=self._interrupt, owner=self)
             for t in subagent_tools(self._subagent):  # subagent（派生子 agent）
                 tools.register(t)
             offload = store.offload_tool_output if store is not None else None
@@ -231,7 +273,14 @@ class Agent:
 
     def _pre_turn(self) -> Iterator[Event]:
         """每轮开头的公共准备：清打断标志、（满了就）压缩、补上一轮遗留的打断标记。run_turn / run_bg_turn 共用。"""
-        self._interrupt.clear()          # 每轮开头清掉上一轮残留的打断标志
+        # 每轮开头清掉上一轮残留的打断标志。
+        # 【已知取舍，勿当新 bug 挖】共用同一个 Event 的从属 agent（前台子 agent、workflow 阶段）
+        # 开轮时也会执行这句，等于替用户撤销刚下的打断 → 存在一个"按 Ctrl+C 却没停下"的窗口。
+        # 实测量过：窗口 ≈ 派发那 5ms，整轮 307ms 里占 2%，跑起来之后按一律有效（三个 sleep 子 agent
+        # 真机实测全中断）。后果只是"少停一次得再按一下"，而修它要给 Agent 加字段、动打断主链路——
+        # 收益微小、风险不小，故【有意不修】。真要修的方向：只有自己 new 了这个 Event 的 agent 才清
+        # （主 agent 清=用户发了新消息，语义正确；从属 agent 不清=无权代表用户撤销）。
+        self._interrupt.clear()
         # 加固④：上下文压缩 —— 在追加本轮内容【之前】压一次。优先用上次请求返回的精确 prompt_tokens
         # 判断（token 只有请求后才知道，故用上次的值）；为 0 时（后端不回 usage / 刚压缩完）用本地
         # 字符粗估兜底——否则不回 usage 的后端永不触发压缩，一路涨到撑爆窗口。
@@ -513,10 +562,10 @@ class Agent:
 
     def _exec_tool(self, tc: ToolCall) -> Iterator[Event]:
         """执行单个工具：过闸 → ToolStarted → execute → 结果处理 → ToolResult → 记录。"""
-        allowed = self._gate(tc)             # 权限闸：可能弹审批（阻塞）——放在 ToolStarted 前
+        allowed, no_approver = self._gate(tc)   # 权限闸：可能弹审批（阻塞）——放在 ToolStarted 前
         yield ToolStarted(tc.name, tc.arguments, tc.id)
-        if not allowed:                      # 被拒：明确叫停（文案见 _DENY_TOOL）
-            result = _DENY_TOOL.format(name=tc.name)
+        if not allowed:                      # 被拒：明确叫停（文案见 _DENY_TOOL / _DENY_NO_APPROVER）
+            result = (_DENY_NO_APPROVER if no_approver else _DENY_TOOL).format(name=tc.name)
             yield ToolResult(tc.name, result, tc.id)
             self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
             return
@@ -576,10 +625,10 @@ class Agent:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         runnable: list[ToolCall] = []
         for tc in tcs:
-            allowed = self._gate(tc)
+            allowed, no_approver = self._gate(tc)
             yield ToolStarted(tc.name, tc.arguments, tc.id)
             if not allowed:
-                result = deny_msg.format(name=tc.name)
+                result = (_DENY_NO_APPROVER if no_approver else deny_msg).format(name=tc.name)
                 yield ToolResult(tc.name, result, tc.id)
                 self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
             else:
@@ -605,24 +654,30 @@ class Agent:
         if self.store is not None:
             self.store.mark_compaction(image=image)
 
-    def _gate(self, tc: ToolCall) -> bool:
-        """工具执行前的权限闸。返回 True=放行执行。policy=None 则全放（旧行为/测试）。
-        判成 ask 时调注入的 ask_permission 问用户（once/always/deny）；always 记进策略本进程即时生效。"""
+    def _gate(self, tc: ToolCall) -> tuple[bool, bool]:
+        """工具执行前的权限闸。返回 (放行?, 是否因"没人可审批"而拒)。policy=None 则全放（旧行为/测试）。
+        判成 ask 时调注入的 ask_permission 问用户（once/always/deny）；always 记进策略本进程即时生效。
+
+        第二个返回值用来选拒绝文案：显式 deny 规则 / 用户点了拒绝 → "用户拒绝"；而"判成 ask 但没有
+        可审批的用户"（无头）是系统自动拒的，说成"用户拒绝"是假信息，模型会照此向上汇报。"""
         if self.policy is None:
-            return True
+            return True, False
         decision = self.policy.decide(tc.name, tc.arguments)
         if decision == ASK:
             if self.ask_permission is None:
-                return False              # 需要问却没人能问（无头）→ 保守拒绝
-            choice = self.ask_permission(tc.name, tc.arguments)   # once / always / deny
+                return False, True        # 需要问却没人能问（无头）→ 保守拒绝（文案见 _DENY_NO_APPROVER）
+            # 带上"谁在问"：审批循环要盯【本 agent】的打断标志、弹窗要据此决定给不给"停止此分支"
+            choice = self.ask_permission(tc.name, tc.arguments,
+                                         AskContext(self._interrupt, self._is_subagent,
+                                                    self._own_branch))
             if choice == ALWAYS:
-                specs = self.policy.allow_always(tc.name, tc.arguments)  # 生成 spec（管道可多条）+ 本进程即时生效
-                if self.store is not None:
-                    for spec in specs:
-                        self.store.add_permission(tc.name, ALLOW, spec)  # 逐条落项目级 permissions.json（跨会话）
-                return True
-            return choice != DENY         # once → 放行；deny → 拒绝
-        return decision == ALLOW
+                # 生成规则（管道可多条；bash 还会连带 read_file/write_file 的落点授权）+ 本进程即时生效。
+                # 故落盘要用【每条规则自己的工具名】，不能一律记在 tc.name 名下。
+                for gtool, spec in self.policy.allow_always(tc.name, tc.arguments):
+                    self._persist_perm(gtool, ALLOW, spec)     # 逐条落项目级 permissions.json（跨会话）
+                return True, False
+            return choice != DENY, False  # once → 放行；deny → 拒绝（确实是用户拒的）
+        return decision == ALLOW, False
 
     def _summarize(self, summary_messages: list[dict]) -> str:
         """用 provider 跑一次（不带工具），把流式文本累积成摘要。

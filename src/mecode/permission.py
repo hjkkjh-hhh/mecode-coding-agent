@@ -48,8 +48,9 @@ DEFAULT_RULES: dict[str, dict[str, list[str]]] = {
     "kill_bgtask": {"allow": ["*"]},
     # 提问工具：它的动作就是"弹界面问用户"本身，用户在弹窗里作答即完成把关 → 再过审批闸是双重打扰。
     "ask_user": {"allow": ["*"]},
-    # 派生子 agent：主 agent 既决定派活即信任（选项 a，子 agent 内部也 policy=None 全放）；且前台并发批会
-    # 一次派多个，若逐个弹审批会 N 连问。故放行 subagent 本身（子 agent 内部动作的风险由"信任委派"承担）。
+    # 派生子 agent：放行的是【派生这个动作】本身——它只是开一个干净上下文，不碰文件不跑命令。
+    # 真正的风险在子 agent 内部的动作，那些现在【继承主 agent 的 policy 逐个过闸】（见 subagent.py 头），
+    # 不再是"派活即信任"的全放行——所以这里放行 subagent 不构成绕过口。
     "subagent": {"allow": ["*"]},
     # run_workflow 不进默认放行（落 default=ask）：一次 workflow = 一批子 agent + 数分钟执行 + 真金 token，
     # 分量比单个 subagent 重得多，起跑前该让用户看一眼结构（几个阶段、干什么）再放行。
@@ -99,26 +100,77 @@ def _pipeline_segments(command: str) -> list[str] | None:
     return segs
 
 
+def _strip_wildcards(path: str) -> str:
+    """路径里带 * 或 ? 时，截到【第一个含通配的段之前】——取它真正落在哪个目录。
+
+    模型偶尔把通配符写进 path（`grep path="C:/桌面/*"`）。不截的话这个串会一路带进判定与 spec：
+    `_spec_match` 见到 * 就走 fnmatch，而 fnmatch 的 * 跨 `/` → 那条 spec 等于"这个目录下的一切"，
+    弹窗上却显示成 `C:/桌面/*`（读起来像只批了一层）。护栏②即便判出"圈住了项目根"要收窄，收窄的
+    目标也还是这个带 * 的串 —— 收了个寂寞。源头截掉，判定与 spec 都基于真实落点，护栏也就有的可收。
+
+    【只截 * 和 ?，不截 [】：`data[1]`、`Season [2020]` 是合法目录名，按 [ 截会把正常路径切错；
+    它们由 _esc_glob 在拼 `/**` 时转义处理（精确形态走逐字符相等，本就无需转义）。
+    两个工具在执行侧也不接受带通配的 path（tools 里 `base.is_dir()` 直接判假），故按目录前缀理解是保守且正确的。"""
+    if "*" not in path and "?" not in path:
+        return path
+    out: list[str] = []
+    for seg in path.split("/"):
+        if "*" in seg or "?" in seg:
+            break
+        out.append(seg)
+    return "/".join(out)
+
+
 def _subject(tool: str, args: dict) -> str:
     """取该工具用于匹配的串（路径类统一正斜杠，便于和规则比对）。"""
     if not isinstance(args, dict):
         return ""
     if tool == "bash":
-        return args.get("command", "")
+        cmd = args.get("command", "")
+        # strip：前导空白对 shell 无意义，但会让 `  ls` 匹配不上 `ls:*` 前缀 spec——判定与"总是允许"
+        # 记下的规则就此对不上（点了不再问、下次还问）。归一化后两边同源。
+        return cmd.strip() if isinstance(cmd, str) else ""
+    if tool not in _PATH_TOOLS:
+        return ""
+    # 路径类：path 不是字符串（模型偶尔给数字/数组/对象）→ 当空，别让权限闸抛异常。
+    # 闸在 tools.execute 的 catch-all【外面】：抛出去会中断整轮、留下无结果的孤儿 tool_call。
+    path = args.get("path")
+    if not isinstance(path, (str, type(None))):
+        return ""
+    path = _strip_wildcards((path or "").replace("\\", "/"))
     if tool in ("read_file", "write_file", "edit_file"):
-        return (args.get("path", "") or "").replace("\\", "/")
+        return path
     if tool == "grep":                            # grep 的 pattern 是内容正则、搜索被 path 框住 → 只看 path
-        return (args.get("path") or os.getcwd()).replace("\\", "/")
+        return path or os.getcwd().replace("\\", "/")
     if tool == "glob":
-        # glob 的 pattern 是【路径通配】，含 .. 时能逃出 path（glob(path=".", pattern="../../*") 会列到根外）。
-        # 正常 pattern（无 ..）不改变可达根 → 主体仍取 path，保持 spec/显示干净；含 .. → 把 path+pattern 合并，
-        # 让"根内放行"检查看到真实落点（.. 由 _abs 的 abspath 归一化解掉），否则 path 在根内就被绕过。
-        base = args.get("path") or "."
-        pat = args.get("pattern") or ""
-        if ".." in pat.replace("\\", "/").split("/"):
-            return os.path.join(base, pat).replace("\\", "/")
-        return base.replace("\\", "/")
+        # 只取 path：pattern 能不能爬出根，由独立的一道闸判（_glob_escapes）。
+        # 曾经把"含 .. 的 pattern"合并进 subject 来兜——那是想【静态推断 pattern 的落点】，两轮审查
+        # 证明这条路走不通（花括号可以把 .. 藏进 token、只看第一个含 .. 的分支可被换序绕过、
+        # `**/../*` 的落点更是静态算不出）。subject 回归干净的 path，让 spec 与显示都不带通配符。
+        return path or "."
     return ""
+
+
+def _glob_escapes(args: dict, root: str) -> bool:
+    """glob 的 pattern 会不会把搜索落点带出 path：**展开后任一支含 `..` 段即算逃出**。
+
+    实测（隔离目录跑 pathlib）：`../*`、`{..,x}/**/*`、`**/../*`、`*/../../*`、`src/**/../../*`
+    全都真的枚举到了 path 外，而 `..` 是唯一出路——绝对 pattern 被 pathlib 直接拒（
+    NotImplementedError），`~` 不展开（当普通目录名）。故不再去静态推算落点（那类推算正是此前
+    被绕过的地方：花括号能把 .. 藏进段里、`**/..` 在字符串层会自我抵消），一律禁掉 `..`。
+    tools._glob 侧同样报错，两边同源。
+
+    逐支检查【所有】展开分支：`{nonexistent/..,../../..}/**/*` 把自我抵消的一支放在前面，
+    只看第一支就会被整个绕过（实测 decide 曾直接 allow）。展开只做一层，与 _expand_braces 一致。"""
+    from .tools import _expand_braces      # 局部 import：避免 permission ↔ tools 顶层循环
+    # 类型消毒在【这里也要做】：本函数被 _gen_specs 与 decide 直接喂【原始 args】，绕过了 _subject
+    # 那道闸。而权限闸在 tools.execute 的 catch-all【外面】：抛异常会中断整轮留下孤儿 tool_call，
+    # 走 pattern_for 那条更是落在 UI 线程里带 traceback 掀掉整个 TUI。
+    if not isinstance(args, dict):
+        return True                        # 连 args 都不是 dict → 保守判逃出（落 ask）
+    pat = args.get("pattern")
+    pat = pat.replace("\\", "/") if isinstance(pat, str) else ""
+    return any(".." in p.split("/") for p in (_expand_braces(pat) if "{" in pat else [pat]))
 
 
 def _spec_match(spec: str, subject: str) -> bool:
@@ -141,30 +193,79 @@ def _any(specs: list[str], subject: str) -> bool:
     return any(_spec_match(s, subject) for s in specs)
 
 
+def _allow_subjects(tool: str, args: dict) -> list[str]:
+    """allow 侧比对用的 subject 形态列表——**单一真相源**：decide() 与 specs_for() 的自检都走这里。
+
+    路径类工具：
+    ① _abs = realpath 真实落点（解掉 .. 与软链/junction/subst）——匹配"项目根内放行"的绝对规则，
+       也让模型给的相对路径/'.'/'src' 能命中它。这一条是权威形态。
+    ② 归一化的【相对】形态——仅为匹配用户自己写的相对 spec（如 src/**）而补；subject 本身是绝对
+       路径时【不补】：对它而言相对形态就是那个未解析的原始串，留着等于再开一次绕过口子
+       （`<根>/../../etc/x`、`<根>/软链/x` 都以根开头，会被 `<根>/**` 匹配上而放行）。
+    其余工具：就是它自己的 subject。
+
+    抽成一处的理由：spec 生成与判定必须用同一套形态，否则"记住的"和"检查的"会漂移——本模块
+    已经因为这类漂移栽过好几次（V1 的原始串 vs 落点、spec_for 的未解析串 vs decide 的落点）。"""
+    subject = _subject(tool, args)
+    if tool not in _PATH_TOOLS:
+        return [subject]
+    out: list[str] = []
+    if a := _abs(subject):
+        out.append(a)
+    n = _norm(subject)
+    if n and not os.path.isabs(n) and n not in out:
+        out.append(n)
+    return out
+
+
 def _same_path(a: str, b: str) -> bool:
     """两路径是否指向同一文件（归一化盘符大小写、正反斜杠、相对→绝对）。计划文件写例外用。"""
     if not a or not b:
         return False
-    try:
-        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    try:                       # realpath 与 _abs 同源：软链/junction 下两个写法指向同一文件也算同一个
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
     except (OSError, ValueError):
         return False
 
 
 # 路径类工具：subject 是路径/搜索目录，可能是相对（模型常给 '.'/'src'/'src/x.py'）。
 _PATH_TOOLS = ("read_file", "write_file", "edit_file", "grep", "glob")
+_FILE_TOOLS = ("read_file", "write_file", "edit_file")   # 只有它们受护栏②约束，理由见 _guard
 
 
 def _abs(subject: str) -> str:
-    """把路径类 subject 按 cwd 解析成绝对、统一正斜杠；空/异常返回空串。
+    """把路径类 subject 解析成【真实落点】的绝对路径、统一正斜杠；空/异常返回空串。
     用途：和"项目根内放行"的【绝对】规则比对——模型给相对路径时，相对形态匹配不上绝对根规则，
-    补一个绝对形态一并比对才能命中（相对语义本就相对 cwd、与工具实际执行一致）。"""
+    补一个绝对形态一并比对才能命中（相对语义本就相对 cwd、与工具实际执行一致）。
+
+    用 realpath 而非 abspath：abspath 是纯字符串运算，不问文件系统"这段路是不是替身"——项目内
+    一个指向根外的软链/junction（node_modules 里很常见）或 subst 虚拟盘符，abspath 算出来仍在根内
+    而 open() 会跟着替身走到根外，又是"检查的 ≠ 执行的"。realpath 逐段解开替身，判的是真实落点。
+    对不存在的路径（write_file 新建）能解多少解多少、结果同 abspath；代价是每次多几个系统调用
+    （~0.3ms，相对一次工具调用可忽略）。注意：root 侧必须同步 realpath（见 from_persisted），
+    否则项目根本身位于软链下时两边不同源，正常路径会全部误落 ask。"""
     if not subject:
         return ""
     try:
-        return os.path.abspath(subject).replace("\\", "/")
+        return os.path.realpath(subject).replace("\\", "/")
     except (OSError, ValueError):
         return ""
+
+
+def _norm(subject: str) -> str:
+    """把路径类 subject 里的 . / .. 在字符串层解掉（不转绝对，保住相对形态）；空/异常返回原串。
+
+    为什么必须解：allow 侧的根规则是 `<根>/**`，而 fnmatch 的 `*` 会跨 `/`（不同于 shell glob）
+    ——原始串 `<根>/../../etc/passwd` 以根开头，就被 `<根>/**` 匹配上而放行，可 open() 时 OS 会
+    真的执行那两个 ..、落到根外。即"检查的字符串 ≠ 执行的路径"。先归一化，落点在字符串层就摆正
+    （`<根>/../x` → `<根>` 的上级/x，不再匹配 `<根>/**`），而 `src/x.py` 归一化后不变、用户的
+    相对 spec 照常命中。与 bash 侧同源：那边 _path_escapes_root 也是先算落点再判根内。"""
+    if not subject:
+        return ""
+    try:
+        return os.path.normpath(subject).replace("\\", "/")
+    except (OSError, ValueError):
+        return subject
 
 
 # 默认放行、但会读【任意文件内容】的 bash 命令：命中放行后要额外核查它读取的文件落在项目根内。
@@ -194,20 +295,18 @@ def _glob_base(tok: str) -> str:
     return "/".join(base)
 
 
-def _path_escapes_root(tok: str, root: str) -> bool:
-    """路径 token 是否可能落到项目根之外（保守：判不准就算逃出）。
-    含 $（变量）或 {}（花括号展开）、或通配里还带 ..（`*/../x` 展开后能爬出根）一律保守判逃出——
-    这些 shell 展开静态判不了落点，且都能把 .. 藏进去爬出根（`cat {.,..}/x` 会展开出 ../x）。"""
+def _probe(tok: str) -> str | None:
+    """路径 token → 它的【落点】；None = 静态算不出，调用方一律保守处理。
+
+    算不出的三种（都能把 .. 藏进去、展开后爬出根）：含 $ 变量、含 {} 花括号、通配里还带 ..。
+    含通配无 .. 则取通配前的目录前缀（`*.txt`→cwd、`/var/log/*`→/var/log）：那是能触及的最上层目录。"""
     if "$" in tok or "{" in tok or "}" in tok:
-        return True                                  # 变量 / 花括号展开：shell 展开到未知落点
+        return None
     if any(c in tok for c in "*?["):
         if ".." in tok.split("/"):
-            return True                              # 通配 + .. → 展开后落点不可控
-        probe = _glob_base(tok) or "."               # 否则判通配前的目录前缀（*.txt→cwd、/var/*→/var）
-    else:
-        probe = tok
-    p = _abs(os.path.expanduser(probe))              # 先展开 ~，再按 cwd 解析成绝对
-    return not _in_root(p, root)
+            return None
+        tok = _glob_base(tok) or "."
+    return os.path.expanduser(tok) or "."
 
 
 def _flag_file_value(cmd: str, tok: str) -> str | None:
@@ -229,105 +328,307 @@ def _flag_file_value(cmd: str, tok: str) -> str | None:
     return None
 
 
-def _read_cmd_paths_in_root(command: str, root: str) -> bool:
-    """command 是单条（无管道）bash 命令。首词若是受管控读命令（_READ_CMDS），核查它读取的每个文件都在 root 内。
-    非这些命令 → True（不额外管）；解析失败 → False（保守）。
-    做法：位置参数一律当文件核查——grep 不再猜测 pattern（贴附形式 -e./-iefoo 会让"跳过一个位置参数当
-    pattern"误跳掉真文件，是已证实的绕过口子）；代价是 pattern 若长得像根外路径会被误拦（罕见、可 always-allow）。
-    另抽出贴附的读文件 flag 值核查（长 --x=值 / grep 短 -f<值>）；分开写的值由位置参数覆盖。"""
+# 接受 diff 选项（含写文件的 --output）的默认放行 git 子命令：三者都能 `--output=<file>` 写任意文件。
+_GIT_DIFF_SUBCMDS = frozenset({"diff", "log", "show"})
+
+
+def _bash_file_probes(command: str) -> tuple[list[str], list[str]] | None:
+    """单条（无管道）bash 命令会碰到的文件【落点】：(要读的, 要写的)。
+    None = 静态算不出，调用方保守拦；([], []) = 不碰文件。
+
+    只解析【默认放行、却能碰任意文件】的两类命令，其余返回 ([], [])（不在 allow 名单里，走正常审批）：
+    ① _READ_CMDS（cat/head/tail/grep/wc/cut）：位置参数一律当文件——grep 不猜 pattern（贴附形式
+       `-e.`/`-iefoo` 会让"跳过一个位置参数当 pattern"误跳掉真文件，已证实的绕过口子）；代价是
+       pattern 像路径时会被当文件判。另抽出贴附的读文件 flag 值（`--x=值`、grep `-f<值>`）。
+       `--files0-from` 从清单/stdin 取一批文件名再逐个打开，界定不了 → None。
+    ② `git diff/log/show`：读——两个操作数至少一个在工作树外时会隐式进入 no-index 模式 dump 任意
+       文件，故【像路径的】操作数当读落点（纯 ref/pathspec 如 HEAD、origin/main 不动）；
+       写——`--output=<file>` 把 diff 写进任意文件，不经 shell、一个元字符都没有，是 `git diff > f`
+       绕开元字符闸的写法，故当写落点。分开写的 `--output <file>` 目标在下一个 token。
+
+    返回落点而不是直接判在不在根内：判据交给 read_file / write_file 两道闸（见 _file_gate_ok），
+    "同一个文件能不能读"只有一套答案。"""
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:
-        return False                                 # 引号不配对等 → 保守（当作解析不了）
+        return None                                  # 引号不配对等 → 解析不了，保守
     if not tokens:
-        return True
+        return [], []
     cmd = tokens[0]
-    if cmd not in _READ_CMDS:
-        # shlex 命令名可能与 bash 分叉：cat$'' / cat$"" / cat$x 里 shlex 不解析 $''(ANSI-C)/$""(locale)/
-        # $var，把 $ 粘进命令名 token（'cat$'）→ 脱离 _READ_CMDS 使根闸短路，而 bash 会折叠成 cat 读文件。
-        # 用与 allow 判定同源的 _spec_match 重判原始命令：仍匹配某读命令 spec（cat:* 等，$ 算词边界）就
-        # 说明它其实是读命令、只是名字被污染 → shlex 后续 token 也不可信 → 保守判逃出（ask）。否则真不是读命令。
+    is_git = tokens[:1] == ["git"] and tokens[1:2] in ([s] for s in _GIT_DIFF_SUBCMDS)
+    if cmd not in _READ_CMDS and not is_git:
+        # shlex 的命令名可能与 bash 分叉：`cat$''`/`cat$x` 里 shlex 把 $ 粘进命令名 token（'cat$'）
+        # → 脱离 _READ_CMDS 使闸短路，而 bash 折叠成 cat 去读文件。用与 allow 判定同源的 _spec_match
+        # 重判原始命令：仍匹配某受管控命令的 spec 就说明名字被污染 → 后续 token 也不可信 → None。
         stripped = command.strip()
-        return not any(_spec_match(f"{rc}:*", stripped) for rc in _READ_CMDS)
-    for tok in tokens[1:]:
-        if tok.startswith("-"):                       # flag：跳过；贴附的读文件 flag 值（--x=/grep -f）另抽出核查
-            # wc --files0-from：从(stdin/清单文件)取一批文件名再逐个打开——静态无法界定这批文件的落点
-            #（值指向 stdin `-` 或根内清单时能间接读根外文件）→ 一律问。是六个读命令里唯一的"间接读一批文件"选项。
-            if tok == "--files0-from" or tok.startswith("--files0-from="):
-                return False
-            f = _flag_file_value(cmd, tok)
-            if f is not None and _path_escapes_root(f, root):
-                return False
-            continue
-        if _path_escapes_root(tok, root):             # 位置参数 = 文件
-            return False
-    return True
+        managed = [f"{rc}:*" for rc in _READ_CMDS] + [f"git {sc}:*" for sc in _GIT_DIFF_SUBCMDS]
+        return None if any(_spec_match(sp, stripped) for sp in managed) else ([], [])
 
+    reads: list[str] = []
+    if not is_git:
+        for tok in tokens[1:]:
+            if tok.startswith("-"):                   # flag：贴附的读文件值另抽出，其余跳过
+                if tok == "--files0-from" or tok.startswith("--files0-from="):
+                    return None                       # 间接读一批文件，界定不了
+                f = _flag_file_value(cmd, tok)
+                if f is not None:
+                    if (p := _probe(f)) is None:
+                        return None
+                    reads.append(p)
+                continue
+            if (p := _probe(tok)) is None:            # 位置参数 = 文件
+                return None
+            reads.append(p)
+        return reads, []
 
-def _git_diff_paths_in_root(command: str, root: str) -> bool:
-    """`git diff` 给两个文件系统路径、且至少一个在工作树外时，会【隐式进入 no-index 模式（无需 --no-index
-    旗标）】diff/dump 任意文件内容（含根外）。git 在默认放行的 `git diff:*` 里、又非 _READ_CMDS 读命令 →
-    走不到上面那道闸。这里补查 `git diff` 的【像路径的】操作数都在根内：含 / ~ \\ : 或以 . 开头的当路径核查；
-    纯 ref/pathspec（HEAD、main、HEAD@{2}、origin/main 等，无路径分隔符）照放，普通 git diff path 也天然根内。"""
-    try:
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        return False
-    if tokens[:2] != ["git", "diff"]:                 # 只管 `git diff …`（allow 也只经 git diff:* 命中）
-        return True
+    writes: list[str] = []
+    want_output = False                               # 上一个 token 是分开写的 --output
     for tok in tokens[2:]:
-        if tok.startswith("-"):                       # flag 跳过
+        if want_output:
+            want_output = False
+            if (p := _probe(tok)) is None:
+                return None
+            writes.append(p)
             continue
-        # 像路径（会经 _path_escapes_root 核查）：以 . 开头 / 含路径分隔或盘符 / 含 $ 变量展开（无 git ref 用 $）
-        # / 花括号里带 , 或 ..（花括号展开成路径，如 {..,.}）。reflog ref HEAD@{2} 含 {} 但无 ,/.. → 不误伤。
+        if tok.startswith("-"):
+            if tok == "--output":
+                want_output = True
+            elif tok.startswith("--output="):
+                if (p := _probe(tok.split("=", 1)[1])) is None:
+                    return None
+                writes.append(p or ".")
+            continue
+        # 像路径：以 . 开头 / 含路径分隔或盘符 / 含 $（没有 git ref 用 $）/ 花括号里带 , 或 ..
+        # （会展开成路径，如 {..,.}）。reflog ref `HEAD@{2}` 含 {} 但无 ,/.. → 不误伤。
         looks_path = (tok[:1] == "." or any(c in tok for c in "/~\\:$")
                       or ("{" in tok and ("," in tok or ".." in tok)))
-        if looks_path and _path_escapes_root(tok, root):
-            return False                              # 像路径且逃出根 → 拦（纯 ref/pathspec 不动）
-    return True
+        if looks_path:
+            if (p := _probe(tok)) is None:
+                return None
+            reads.append(p)
+    return (None if want_output else (reads, writes))  # --output 悬在末尾 → 目标不明，保守
 
 
-def spec_for(tool: str, args: dict) -> str:
-    """"总是允许"时为 (tool, args) 生成要记住的 spec：
-    bash → 命令首词前缀（rm:*）；读/写/改 → 文件【所在文件夹】（C:/a/b/*，不是整工具、也不是只此一文件）；
-    其余 → '*'。"""
+_GLOB_META = "*?["                            # fnmatch 里有特殊含义的字符（] 不在类内时是字面量）
+
+
+def _esc_glob(s: str) -> str:
+    """把路径里的 fnmatch 元字符转义成单字符类，让 spec 只按【字面】匹配。
+    `data[1]`、`Season [2020]`、`log[old]` 这类是合法目录名，不转义会被当字符类：既匹配不回自己
+    （pattern 里的 `[1]` 要求单个字符 '1'，而路径里是字面 '[1]'），又会误授权到 `data1` 这种从没批过的路径。"""
+    return "".join(f"[{c}]" if c in _GLOB_META else c for c in s)
+
+
+def _exact_cmd_spec(cmd: str) -> str:
+    """整条命令的【精确】spec：只匹配它自己。含 * ? 才转义成单字符类（否则 _spec_match 走 fnmatch，
+    `rm *.tmp` 会当模式匹配到 `rm 别的.tmp`）；不含时保持原样走逐字符相等——无谓地转义 [ 会让
+    `cat x[1]` 变成 `cat x[[]1]` 而永远匹配不回自己（_guard 不变量①栽过这个坑）。"""
+    return _esc_glob(cmd) if ("*" in cmd or "?" in cmd) else cmd
+
+
+def _cmd_spec(cmd: str) -> str:
+    """命令 → "总是允许"要记的 spec。
+    **首词后紧跟非选项词** → 发两词前缀（`git diff:*`）；**否则** → 整条命令精确（不带 `:*`）。
+
+    只记首词太宽：`git diff HEAD~1` 记成 `git:*` 等于把 `git push --force`、`reset --hard` 一并放行；
+    `python 脚本.py` 记成 `python:*` 更是换来 `python -c "任意代码"`。
+
+    为什么中间夹了选项就不发前缀：`-` 前缀分不出"选项的值"和"子命令"。`python -m pytest -q` 取到第一个
+    非选项词是 `pytest`（恰好是想要的），但 `python -X utf8 script.py` 取到的是 `utf8`（`-X` 的值）
+    → 发出 `python -X utf8:*` → `python -X utf8 -c "任意代码"` 照样命中，和 `python:*` 是同一个洞；
+    `git -c k=v diff`、`docker -H x ps`、`npm --prefix ./app run build` 同理。断在哪判不了，就不断
+    ——整条记下来，一个字都不许变。代价：带选项的命令"总是允许"退化成"记住这一条"（`python -m pytest -q`
+    批过后换 `-v` 要再批）。单词命令（`make`）也走精确：后面追加参数是另一个动作，不该顺带授权。"""
+    parts = cmd.split()
+    if len(parts) >= 2 and not parts[1].startswith("-"):
+        return f"{parts[0]} {parts[1]}:*"      # 命令名 + 子命令：前缀授权（与默认名单的 git log:* 同形）
+    return _exact_cmd_spec(cmd)
+
+
+def _root_like(folder: str, root: str | None) -> bool:
+    """folder 是不是"大到不该被一次点击授权出去"的容器：项目根本身 / 盘符根 / 文件系统根 / UNC 共享根。
+    这类要退回【精确到该文件】——否则在项目根下建一个 notes.md 点一次"总是允许"，就等于把整个项目
+    （含 .mecode/permissions.json 与 .git/）的写权限永久发出去，normal 模式一键变成 auto 模式。
+    注：folder 是项目根【祖先】的情形不在这里判——那由 _guard 的范围护栏统一兜住（它比逐条列举可靠）。"""
+    if not folder:
+        return True                               # POSIX 根（'/x.txt' rsplit 后是空串）
+    if root and os.path.normcase(folder) == os.path.normcase(root):
+        return True                               # 项目根
+    if folder.startswith("//"):                   # UNC：\\server 或 \\server\share 都是"整台机/整个共享"
+        return len([s for s in folder[2:].split("/") if s]) <= 2
+    return len(folder) <= 2 and folder.endswith(":")   # 盘符根 C:
+
+
+def specs_for(tool: str, args: dict, root: str | None = None) -> list[str]:
+    """对外入口：生成候选 spec（_gen_specs）后【一律过护栏】（_guard）。
+    分两步的理由见 _guard——不变量由护栏统一强制，各分支写错也兜得住。"""
+    return _guard(_gen_specs(tool, args, root), tool, args, root)
+
+
+def _gen_specs(tool: str, args: dict, root: str | None = None) -> list[str]:
+    """"总是允许"要记住的 spec 列表。**空列表 = 这次调用【不可授权】**（弹窗不该给"总是允许"这一项）。
+
+    三条不变量（每条都对应一个实测过的坑）：
+    ① **能匹配回自己**：生成的 spec 必须命中本次调用在 decide() 里用的那个 subject 形态，否则就是
+       "点了不再问、下次还问"。故 spec 从 _abs 落点算（与 decide 同源）；grep/glob 的 subject 就是
+       那个目录本身，只给 `<dir>/**` 匹配不回它（fnmatch 下还差一个分隔符）→ 必须同时记 `<dir>`
+       ——这正是根规则写成 [root, root/**] 两条的原因。
+    ② **不得比"被批准的那个对象"更宽**：算不出有意义的范围时【不生成】（返回 []），绝不退化成 '*'
+       或整盘。'*' 只属于本来就没有细分维度的工具（subagent/web_*/MCP 等，粒度就是工具本身）。
+    ③ **只按字面匹配**：路径里的 * ? [ 要转义（见 _esc_glob）。
+
+    root = 项目根（allow_always 传 self.root）：用来判"文件夹是不是大到不该整片授权"（见 _root_like）。
+    """
     if tool == "bash":
-        parts = _subject(tool, args).split()
-        return f"{parts[0]}:*" if parts else "*"
-    if tool in ("read_file", "write_file", "edit_file"):
-        path = _subject(tool, args)               # 文件 → 所在文件夹
-        if "/" in path:
-            folder = path.rsplit("/", 1)[0]
-            if folder:
-                return f"{folder}/*"
-        return path or "*"                        # 无所在文件夹（裸文件名/根级）→ 精确到该文件，别放整工具
-    if tool in ("grep", "glob"):                  # 搜索路径本身就是目录 → 授权它及其下
-        path = _subject(tool, args).rstrip("/")
-        if path:
-            return f"{path}/*"
-    return "*"
-
-
-def specs_for(tool: str, args: dict) -> list[str]:
-    """"总是允许"要记住的 spec 列表。bash 纯管道 → 每一段的命令头各记一条（head:*），这样以后同类管道
-    每段都命中 allow、不再问；其余（非管道 bash / 路径类）→ 单条（见 spec_for）。"""
-    if tool == "bash":
-        segs = _pipeline_segments(_subject(tool, args))
-        if segs is not None:                      # 纯管道：逐段取首词头
+        cmd = _subject(tool, args)
+        if not cmd.strip():
+            # 畸形调用：参数被截断时 provider 会给 {'__raw__':..,'__error__':..}（无 command 键），
+            # 缺键/空串/纯空白都走到这。此前它退化成 '*' → 一次点击永久无条件放行【全部】bash。
+            return []
+        segs = _pipeline_segments(cmd)
+        if segs is not None:                      # 纯管道：逐段各记一条，以后同类管道每段都命中
             heads: list[str] = []
             for s in segs:
-                parts = s.split()
-                sp = f"{parts[0]}:*" if parts else "*"
-                if sp not in heads:
+                if not s.split():
+                    return []
+                # 【必须与单条命令同源】：这里曾经只取首词，于是 `git log … | jq .` 记成 git:*，
+                # 一次点击把 git push --force / reset --hard 全放行。
+                # 同一件事换成管道形态就漏——孪生路径漏改的典型。
+                if (sp := _cmd_spec(s)) not in heads:
                     heads.append(sp)
-            if heads:
-                return heads
-    return [spec_for(tool, args)]
+            return heads
+        if _has_shell_meta(cmd):
+            # 含元字符的命令，decide 压根不看 allow 表（直接落 default）→ 记下的 spec 永远不生效，
+            # 却是一条比本次调用更宽的命令头授权（`echo hi > x` 记成 `echo:*`）。两头都错 → 不可授权。
+            return []
+        return [_cmd_spec(cmd)]
+    if tool in _PATH_TOOLS:
+        raw = _subject(tool, args)
+        base = raw
+        if tool == "glob" and root and _glob_escapes(args, root):
+            # pattern 会把落点带出根：spec 是按 path 生成的，而危险在 pattern 里——记下的规则既
+            # 不能如实表达"批准了列根外"，弹窗上显示的也只是那个根内的 path（不披露逃逸）。
+            # 表达不了就不承诺：不给"总是允许"，用户仍可"允许一次"。同 bash 含元字符那一档。
+            return []
+        path = _abs(base) or _norm(base)          # 与 decide 同源：先算落点（解 .. 与软链）
+        if not path:
+            return []                             # 空 path / 非 dict args → 不可授权（此前记下空串死条目）
+        # 【只在要拼 /** 的 spec 上转义】：那条走 fnmatch，路径里的 * ? [ 不转义会被当模式；
+        # 而【精确 spec】走的是逐字符相等，转义反而比不上（`x[1].txt` 转成 `x[[]1].txt` 就永远不自匹配）。
+        if tool in ("grep", "glob"):              # 搜索路径本身就是目录 → 目录本身 + 其下，两条
+            d = path.rstrip("/") or path
+            return [d, f"{_esc_glob(d)}/**"]
+        folder = path.rsplit("/", 1)[0] if "/" in path else ""
+        if _root_like(folder, root):              # 项目根 / 盘符根 / 文件系统根 → 退回精确到该文件
+            return [path]
+        return [f"{_esc_glob(folder)}/**"]        # 文件 → 所在文件夹及其下
+    # 其余工具（subagent/web_*/task_*/MCP 工具等）subject 恒为空：参数是自然语言 prompt / URL /
+    # 阶段结构，没有可用来收窄范围的维度 →"总是允许"只可能是"以后这个工具都放行"，粒度就是工具本身。
+    return ["*"]
 
 
-def pattern_for(tool: str, args: dict) -> str:
-    """显示用的可读形式（同 Claude 的 Tool(spec)）：如 bash(rm:*)、bash(cat:*, jq:*)、write_file(*)。"""
-    return f"{tool}({', '.join(specs_for(tool, args))})"
+def _guard(specs: list[str], tool: str, args: dict, root: str | None) -> list[str]:
+    """spec 生成后的【机制护栏】：两条不变量在这里被强制成立，而不是靠各分支自己写对。
+
+    这两道是本模块最重要的防线——两轮对抗审查里，spec 生成的坑全部是"某个分支忘了考虑某形态"，
+    而分支只会越加越多。把不变量做成【生成后统一校验】，新分支写错也会被当场兜住。
+
+    ① 自匹配：生成的 spec 必须命中本次调用（用 _allow_subjects，与 decide 同源）。破了 → 退回
+       精确路径形态。此前 _esc_glob 把 `<根>/x[1].txt` 转义成 `<根>/x[[]1].txt`，串里没有 * ?
+       → 落 _spec_match 的【精确相等】分支 → 与原串逐字符比必然不等，用户点了"不再问"却每次还问。
+    ② 范围不外溢：spec 不得把【项目根】整个圈进去（除非被批对象本身就在根内——那是正常的
+       "根内某文件夹及其下"）。此前 _root_like 只认 folder==root、不认 root 的【祖先】，对项目
+       外一层的文件点一次"总是允许"，发出去的 spec 反过来把整个项目连同 .mecode/permissions.json
+       与 .git/ 一起放行。
+       **只管 read/write/edit**：它们的 spec 是"文件所在文件夹 + /**"，比批准的那一个文件宽。
+       grep/glob 不受——subject 就是那个目录、操作又天然递归，批准一次即已读遍整棵树，收掉
+       `<目录>/**` 挡不住任何读取，只制造"批过还问"。
+    """
+    if not specs:
+        return specs
+    subjects = _allow_subjects(tool, args)
+    exact = subjects[0] if subjects else ""
+
+    segs = _pipeline_segments(exact) if tool == "bash" else None
+
+    def ok(spec_list: list[str]) -> bool:
+        # 必须与 decide 同源：管道是【逐段】比对的，拿整条命令去自检等于检查了另一件事
+        # （此前靠"前缀 spec 恰好也是整条命令的前缀"蒙混过关，spec 一变精确就把好 spec 收成了死规则）
+        if segs is not None:
+            return all(_any(spec_list, s) for s in segs)
+        return any(_any(spec_list, s) for s in subjects)
+
+    if tool in _FILE_TOOLS and root and exact:          # ② 范围：spec 不得圈住项目根（grep/glob 见文档）
+        inside = _in_root(exact, root)                  # 被批对象本来就在根内 → 圈到根内某层是正常的
+        if not inside and any(_spec_match(sp, root) or _spec_match(sp, root + "/x") for sp in specs):
+            specs = [exact]
+    if not ok(specs):                                   # ① 自匹配：破了就退回【精确形态】
+        # 路径类 → 精确路径；bash → 整条命令（_exact_cmd_spec 顺带转义 * ?，否则 `rm *.tmp` 会
+        # 落 fnmatch 分支当模式用）。无细分维度的工具 spec 是 '*'，恒自匹配，走不到这。
+        # 管道没有可退的精确形态——整条命令的 spec 在 decide 的逐段比对里用不上，记了也是死规则 → 不授权。
+        if segs is not None:
+            return []
+        specs = [_exact_cmd_spec(exact) if tool == "bash" else exact] if exact else []
+    return specs
+
+
+def _bash_path_grants(command: str, root: str) -> list[tuple[str, str]] | None:
+    """单条 bash 命令点"总是允许"时要【连带】写下的落点授权：[(read_file|write_file, 绝对路径)]。
+    None = 落点算不出 → 这条命令不可授权（闸永远拦它，别承诺）。
+
+    非连带不可：闸按落点问 read_file/write_file，而 bash 侧记的是命令头前缀 `cat /etc/hosts:*`
+    ——它表达不了"这个文件可以读"，只记前缀的话闸下次照样在落点上拦住 = 点了不再问、下次还问。
+    粒度精确到落点（不是 read_file"总是允许"给的文件夹级）：用户批的就是这条命令碰的这几个文件。
+    根内的读不记（默认本就放行）；写一律记（write_file 在根内也要审批）。"""
+    probes = _bash_file_probes(command)
+    if probes is None:
+        return None
+    reads, writes = probes
+    out: list[tuple[str, str]] = []
+    for p in reads:
+        if (a := _abs(p)) and not _in_root(a, root):   # 根内读默认放行，无需授权
+            out.append(("read_file", a))
+    for p in writes:
+        if a := _abs(p):
+            out.append(("write_file", a))
+    return out
+
+
+def grants_for(tool: str, args: dict, root: str | None = None) -> list[tuple[str, str]]:
+    """该次调用点"总是允许"要写下的【全部】规则：[(工具, spec)]。空列表 = 不可授权。
+    多数工具就是 [(自己, spec)]；bash 额外带上落点授权（见 _bash_path_grants）——闸按落点判，
+    授权就得按落点记，两侧同源。"""
+    specs = specs_for(tool, args, root)
+    if not specs:
+        return []
+    out = [(tool, s) for s in specs]
+    if tool == "bash" and root:
+        cmd = _subject(tool, args)
+        for seg in (_pipeline_segments(cmd) or [cmd]):
+            extra = _bash_path_grants(seg, root)
+            if extra is None:
+                return []                              # 有一段的落点算不出 → 整条不可授权
+            out.extend(g for g in extra if g not in out)
+    return out
+
+
+def spec_for(tool: str, args: dict, root: str | None = None) -> str:
+    """单条主 spec（显示/兼容用；多条见 specs_for）。不可授权时返回空串。"""
+    specs = specs_for(tool, args, root)
+    return specs[-1] if specs else ""
+
+
+def pattern_for(tool: str, args: dict, root: str | None = None) -> str:
+    """显示用的可读形式（同 Claude 的 Tool(spec)）：如 bash(rm:*)、bash(cat:*, jq:*)、write_file(C:/a/b/**)。
+    不可授权（grants_for 为空）时返回空串——调用方据此【不显示"总是允许"这一项】，别承诺记不住的事。
+    bash 连带的落点授权也列出来（`bash(cat X:*) + read_file(X)`）：多记了什么就写在弹窗上。"""
+    grants = grants_for(tool, args, root)
+    if not grants:
+        return ""
+    by_tool: dict[str, list[str]] = {}
+    for t, spec in grants:
+        by_tool.setdefault(t, []).append(spec)
+    return " + ".join(f"{t}({', '.join(v)})" for t, v in by_tool.items())
 
 
 def _clone(rules: dict) -> dict:
@@ -337,15 +638,14 @@ def _clone(rules: dict) -> dict:
 
 class PermissionPolicy:
     def __init__(self, rules: dict | None = None, default: str = DEFAULT_DECISION,
-                 root: str | None = None, plan_path: str | None = None,
-                 user_allow: dict[str, list[str]] | None = None) -> None:
+                 root: str | None = None, plan_path: str | None = None) -> None:
         self.rules = _clone(DEFAULT_RULES if rules is None else rules)
         self.default = default
         self.root = root          # 项目根（posix）；模式覆盖里的 @root 占位展开用（auto 放行项目内编辑）。None=无项目上下文
         self.plan_path = plan_path   # 计划文件路径；非 None（=计划模式）时，唯独放行对它的 write/edit（只读之下的写例外）
-        # 用户【显式加】的 allow spec（来自 permissions.json / 运行时 allow_always），和默认 spec 分开记：
-        # 读命令根闸只拦【默认】放行；用户一旦显式 always-allow 过某读命令（记下 cat:*），就放行它的全部路径。
-        self._user_allow = {t: list(v) for t, v in (user_allow or {}).items()}
+        # 注：曾另存一份"用户显式加的 spec"（_user_allow），供读命令根闸开一个"用户授权过这条命令
+        # 就整道闸让路"的出口。那是个提权洞（见 _file_gate_ok），随闸改按落点判已删——授权状态只有
+        # self.rules 一处。
 
     @classmethod
     def from_persisted(cls, saved: dict | None,
@@ -358,17 +658,23 @@ class PermissionPolicy:
         merged = _clone(DEFAULT_RULES)
         root = None
         if project_root:
-            root = os.path.abspath(str(project_root)).replace("\\", "/")
+            # realpath 与 _abs 同源（见其文档）：两边必须都解替身，否则项目根本身位于软链/subst 下时
+            # root 与 subject 不同源，根内的正常路径会全部误落 ask。
+            root = os.path.realpath(str(project_root)).replace("\\", "/")
+            # 去掉尾部斜杠：项目根是盘符根时 realpath 给的是 "C:/"，于是根规则拼成 "C://**"（畸形）、
+            # _in_root 拿 root+"/" = "C://" 去比也永远不中 → 整道闸失灵，根内路径全落 ask。
+            # 普通根不带尾斜杠，这行对它们是空操作。POSIX 根 "/" → "" ：_in_root 的 startswith("/")
+            # 与规则 "/**" 都仍然成立。
+            root = root.rstrip("/") if root != "/" else ""
             for t in ("read_file", "grep", "glob"):
                 merged.setdefault(t, {})["allow"] = [root, f"{root}/**"]   # 根本身 + 根下
         # skill 文件（system prompt 只给索引、模型场景命中时才 read_file 读全文）常在项目根外
         # （内置在安装目录、用户级在 ~/.mecode）——读它们无副作用，默认放行，别为读个流程说明弹授权。
         allow = merged.setdefault("read_file", {}).setdefault("allow", [])
         for d in (Path(__file__).resolve().parent / "skills_builtin",
-                  Path("~/.mecode/skills").expanduser()):
+                  Path("~/.mecode/skills").expanduser().resolve()):   # resolve=realpath，与 _abs 同源
             p = d.as_posix()
             allow.extend([p, f"{p}/**"])
-        user_allow: dict[str, list[str]] = {}
         for tool, groups in (saved or {}).items():
             if not isinstance(groups, dict):       # 跳过旧格式/坏数据（如早期扁平表），别让它搞崩启动
                 continue
@@ -378,10 +684,7 @@ class PermissionPolicy:
                     continue
                 cur = dst.setdefault(decision, [])
                 cur.extend(s for s in specs if s not in cur)
-                if decision == ALLOW:              # 记成"用户显式加的"——读命令根闸对这些 spec 放行全部
-                    ua = user_allow.setdefault(tool, [])
-                    ua.extend(s for s in specs if s not in ua)
-        return cls(rules=merged, root=root, user_allow=user_allow)
+        return cls(rules=merged, root=root)
 
     def decide(self, tool: str, args: dict) -> str:
         """返回 allow / deny / ask。先取该工具的规则组，再 deny > allow > default(ask)。"""
@@ -392,54 +695,72 @@ class PermissionPolicy:
                 and _same_path(subject, self.plan_path):
             return ALLOW
         r = self.rules.get(tool, {})
-        # 路径类工具：相对 subject 补一个按 cwd 解析的绝对形态，两种形态任一命中即算——
-        # 既让"项目根内放行"的绝对规则能命中模型给的相对路径/'.'/'src'（此前误落 ask），
-        # 又保留对用户相对 spec（如 src/**）的匹配。bash 的 subject 是命令，不参与。
-        subjects = [subject]
-        if tool in _PATH_TOOLS:
-            a = _abs(subject)
-            if a and a != subject:
-                subjects.append(a)
-        if any(_any(r.get(DENY, []), s) for s in subjects):
+        # 路径类工具的 allow 比对形态：
+        # ① _abs = realpath 真实落点（解掉 .. 与软链/junction/subst）——匹配"项目根内放行"的绝对规则，
+        #    也让模型给的相对路径/'.'/'src' 能命中它。这一条是权威形态。
+        # ② 归一化的【相对】形态——仅为匹配用户自己写的相对 spec（如 src/**）而补。
+        # 【关键】allow 侧【不】拿未解析的绝对原始串比对，两个已证实的绕过都出在它身上：
+        #    `<根>/../../etc/x` 与 `<根>/软链/x` 都以根开头，会被 `<根>/**` 匹配上而放行（fnmatch 的
+        #    * 跨 /），但 OS 执行时会落到根外——"检查的字符串 ≠ 执行的路径"。
+        subjects = _allow_subjects(tool, args)      # 单一真相源（spec 生成的自检走同一份）
+        # deny 侧另外保留【未解析的原始串】：多一个形态在 deny 是多一次被拦的机会（更安全），
+        # 在 allow 是多一条放行路（更宽松）——同一件事在两侧语义相反。
+        deny_subjects = subjects if subject in subjects else [subject, *subjects]
+        if any(_any(r.get(DENY, []), s) for s in deny_subjects):
             return DENY
         # bash 含 shell 副作用元字符 → 不让 allow 前缀直接放行（deny 已先判过）。
         # 唯一例外：纯管道且【每一段命令都在 allow 名单里】→ 放行（cat|grep|wc 这类只读命令互接，安全、免问）。
         if tool == "bash" and _has_shell_meta(subject):
             segs = _pipeline_segments(subject)
             if segs is not None and all(_any(r.get(ALLOW, []), s) for s in segs):
-                # 每段的读命令（cat/grep 等）路径参数也要过根闸（同下方单命令的根闸）
-                if self.root and not all(self._read_gate_ok(s) for s in segs):
+                # 每段的读命令（cat/grep 等）路径参数也要过落点闸（同下方单命令那道）
+                if self.root and not all(self._file_gate_ok(s) for s in segs):
                     return self.default
                 return ALLOW
             return self.default
         if any(_any(r.get(ALLOW, []), s) for s in subjects):
-            # 读文件内容的命令（cat/head/tail/grep/wc）即便命中放行，路径参数逃出项目根 → 落 ask
-            # （补 read_file 的根闸，防 `cat ~/.ssh/id_rsa` 绕过）。仅在有项目根时生效。
-            if tool == "bash" and self.root and not self._read_gate_ok(subject):
+            # 读/写文件的命令（cat/head/tail/grep/wc/cut、git diff --output）即便命中放行，
+            # 其文件落点仍要各自过 read_file / write_file 那道闸（见 _file_gate_ok）。仅在有项目根时生效。
+            if tool == "bash" and self.root and not self._file_gate_ok(subject):
+                return self.default
+            # glob 的 path 即便在根内，pattern 仍能把搜索落点带出去（../* 、**/../* 、{..,x}/**/*）
+            # → 补一道 pattern 闸。
+            # 【没有"用户显式授权即跳过"的出口】：_glob_escapes 判的是"落点在根内【或 path 自己底下】"，
+            # 所以用户批准过的根外目录配正常 pattern 本就不触发这道闸（不变量①自然成立），出口是多余的；
+            # 而留着它反倒会把【逃逸 pattern】一并放行——那类调用 specs_for 明确判为"不可授权"，
+            # 等于从另一扇门把它授权了出去（批准 glob(C:/某目录) 换来 ../../* 整片列举）。
+            if tool == "glob" and self.root and _glob_escapes(args, self.root):
                 return self.default
             return ALLOW
         return self.default
 
-    def _read_gate_ok(self, command: str) -> bool:
-        """单条 bash 命令过"读命令根闸"：非读命令 / 路径都在项目根内 → True；
-        路径逃出根时，看命令是否命中【用户显式加的】allow spec——命中即放行全部
-        （用户已授权该读命令，根闸只拦默认放行；见 _READ_CMDS 注释）。"""
-        if _read_cmd_paths_in_root(command, self.root) and _git_diff_paths_in_root(command, self.root):
-            return True
-        return _any(self._user_allow.get("bash", []), command)
+    def _file_gate_ok(self, command: str) -> bool:
+        """单条 bash 命令过"文件落点闸"：把它要读/写的文件解析成绝对落点，逐个回头问
+        read_file / write_file 那两道闸——读按读的规矩判、写按写的规矩判。
+
+        按落点问、而不是看命令像不像被授权过：闸管的是"哪几个文件"，而 bash 的 allow spec 是命令头
+        前缀（`cat:*`），粒度对不上。此前末行是"命中任一 bash allow spec 即整道闸让路"，于是尾巴上
+        追加的路径搭便车：批过 `cat README.md` 换来 `cat README.md ../../secret`；批过只读的
+        `git diff` 换来 `git diff --output C:/任意`（读权限就地提权成任意文件写）。
+        改成按落点问后，"同一个文件能不能读/写"只有一套答案，不再有第二套判据可绕。"""
+        probes = _bash_file_probes(command)
+        if probes is None:
+            return False                      # 落点静态算不出（$ 变量 / 花括号 / 通配带 ..）→ 保守拦
+        reads, writes = probes
+        return (all(self.decide("read_file", {"path": p}) == ALLOW for p in reads)
+                and all(self.decide("write_file", {"path": p}) == ALLOW for p in writes))
 
     def add(self, tool: str, decision: str, spec: str) -> None:
         lst = self.rules.setdefault(tool, {}).setdefault(decision, [])
         if spec not in lst:
             lst.append(spec)
 
-    def allow_always(self, tool: str, args: dict) -> list[str]:
-        """记住该次调用对应的"总是允许"spec（本进程即时生效），返回 spec 列表——管道会有多条（每段一条头）；
-        持久化由调用方经 store 逐条落盘。"""
-        specs = specs_for(tool, args)
-        ua = self._user_allow.setdefault(tool, [])
-        for spec in specs:
-            self.add(tool, ALLOW, spec)
-            if spec not in ua:                  # 也记进用户 spec：读命令 always-allow 后根闸对它放行全部
-                ua.append(spec)
-        return specs
+    def allow_always(self, tool: str, args: dict) -> list[tuple[str, str]]:
+        """记住该次调用对应的"总是允许"规则（本进程即时生效），返回 [(工具, spec)]——管道每段一条头，
+        bash 还会连带落点授权，故规则可能落在【别的工具名下】，持久化要按返回的那个工具名落盘。
+        **返回空列表 = 这次调用不可授权**（畸形参数 / 含元字符的 bash / 落点算不出的命令等），此时
+        什么都不记：宁可下次再问，也不留一条记不住或比批准范围更宽的规则。"""
+        grants = grants_for(tool, args, self.root)   # 带上项目根：判"文件夹是否大到不该整片授权"
+        for t, spec in grants:
+            self.add(t, ALLOW, spec)
+        return grants
