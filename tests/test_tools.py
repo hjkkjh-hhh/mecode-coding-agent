@@ -463,3 +463,27 @@ def test_grep_路径用正斜杠(tmp_path):
     for kw in ({}, {"output_mode": "content"}, {"output_mode": "count"}):
         out = _exec("grep", pattern="^L1$", path=str(tmp_path), **kw)
         assert "\\" not in out, out
+
+
+# ---- MECODE_DISABLE_TOOLS：按场景裁掉内置工具 ----
+
+def test_禁用工具_从注册表里真的摘掉(monkeypatch):
+    """裁掉的是工具本身，模型看不到 schema——不是调用时才拒。
+    典型场景：关进无外网环境时摘掉 web_search/web_fetch，免得模型反复试再收一堆连接错误。"""
+    monkeypatch.setenv("MECODE_DISABLE_TOOLS", "web_search,web_fetch")
+    reg = default_registry()
+    names = {t["function"]["name"] for t in reg.schemas()}
+    assert "web_search" not in names and "web_fetch" not in names
+    assert {"read_file", "edit_file", "bash", "grep"} <= names      # 其余不受影响
+
+
+def test_禁用工具_不设或空则全量(monkeypatch):
+    monkeypatch.delenv("MECODE_DISABLE_TOOLS", raising=False)
+    full = {t["function"]["name"] for t in default_registry().schemas()}
+    monkeypatch.setenv("MECODE_DISABLE_TOOLS", "  ,  ")
+    assert {t["function"]["name"] for t in default_registry().schemas()} == full
+
+
+def test_禁用工具_不存在的名字不报错(monkeypatch):
+    monkeypatch.setenv("MECODE_DISABLE_TOOLS", "根本没有这个工具")
+    assert default_registry().schemas()                              # 照常构造，不抛

@@ -818,7 +818,19 @@ def default_registry() -> ToolRegistry:
     from .web import web_tools     # 局部 import：web.py 依赖本模块的 Tool，避免顶层循环
     for t in web_tools():          # web_search / web_fetch（只读联网，权限默认放行）
         reg.register(t)
+    for name in disabled_tools():
+        reg.unregister(name)
     return reg
+
+
+def disabled_tools() -> list[str]:
+    """MECODE_DISABLE_TOOLS 里列出的内置工具名（逗号分隔），部署方按场景裁剪用。
+
+    典型用途是把 agent 关进无外网环境时一并摘掉 web_search / web_fetch：留着它们只会让
+    模型反复尝试再收到一堆连接错误，白费轮次。裁掉的是【工具本身】，模型看不到 schema。
+    """
+    raw = os.getenv("MECODE_DISABLE_TOOLS", "")
+    return [n.strip() for n in raw.split(",") if n.strip()]
 
 
 # ---- ask_user：向用户提问（工厂——只由有交互界面的消费端注册；无头/网关场景没人可答，不进 default_registry） ----
