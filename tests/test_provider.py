@@ -226,12 +226,34 @@ def test_filter_tool_calls档案_纯答案回合剥掉():
     assert out[2]["reasoning_content"] == "想2"           # 工具回合带
 
 
-def test_filter_inert档案_全不带_且不改原消息(tmp_path, monkeypatch):
+def test_filter_未知模型_默认按工具回合带_且不改原消息(tmp_path, monkeypatch):
+    """未知模型默认 keep_reasoning="tool_calls"：回传的是后端【自己发过来的】reasoning_content，
+    不存在发错字段的风险（它没发，历史里就没有）。与"不发 thinking 参数"是两件事。"""
     import mecode.config as cfg
-    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", tmp_path / "config.json")   # 隔离：未知模型会查真实 config 的 keep_reasoning
+    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", tmp_path / "config.json")   # 隔离：会查真实 config
     out = _mk("未注册模型")._filter_reasoning(_HISTORY)
-    assert all("reasoning_content" not in m for m in out if m["role"] == "assistant")
+    assert "reasoning_content" not in out[1]             # 纯答案回合仍剥掉
+    assert out[2]["reasoning_content"] == "想2"          # 工具回合带回去
     assert _HISTORY[1]["reasoning_content"] == "想1"      # 原消息无损（浅拷贝，历史不被改写）
+
+
+def test_filter_未知模型_显式关掉走none哨兵(tmp_path, monkeypatch):
+    """显式"不保留"存的是 "none" 而不是 ""——空串同时也是"从没设过"（老配置里到处是），
+    而默认已改为保留，用空串会让用户点的"不保留"落回默认 = 开关点了没反应。"""
+    import json
+
+    import mecode.config as cfg
+    p = tmp_path / "config.json"
+    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", p)
+    p.write_text(json.dumps({"keep_reasoning": "none"}), encoding="utf-8")
+    pv = _mk("未注册模型")
+    assert all("reasoning_content" not in m for m in pv._filter_reasoning(_HISTORY)
+               if m["role"] == "assistant")
+    # 哨兵要【归一化成 ""】而不是原样留着：留着的话行为虽然碰巧一样（未知 scope 也是全剥），
+    # 但别处读 profile.keep_reasoning 会显示成 "none"（如 /config 的"思维链保留：{x or '不保留'}"）
+    assert pv.profile.keep_reasoning == ""
+    p.write_text(json.dumps({"keep_reasoning": ""}), encoding="utf-8")       # 老配置的空串 = 没设过
+    assert _mk("未注册模型")._filter_reasoning(_HISTORY)[2]["reasoning_content"] == "想2"
 
 
 

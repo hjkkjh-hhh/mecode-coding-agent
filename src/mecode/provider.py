@@ -77,10 +77,14 @@ class Provider:
         self.backend = backend
         p = profile_for(backend.model)
         if context_window_for(backend.model) == 0:
-            # 未知模型：查用户是否在 config 里自定义了思维链保留方式
+            # 未知模型：查用户是否在 config 里自定义了思维链保留方式。
+            # "none" 是【显式关掉】的哨兵——不能用空串表示：空串同时也是"从没设过"（老配置里到处是），
+            # 而 INERT 默认已改为保留，用空串会让用户点的"不保留"落回默认 = 开关点了没反应。
             from .config import load_user_config
             kr = load_user_config().get("keep_reasoning", "")
-            if kr:
+            if kr == "none":
+                p = ThinkingProfile(supports_thinking=False, keep_reasoning="")
+            elif kr:
                 p = ThinkingProfile(supports_thinking=False, keep_reasoning=kr)
         self.profile = p   # 该模型的思考【能力】档案（拼包/回传 reasoning 都看它）
         # 思考运行态（TUI 弹窗切、随会话持久化）：thinking_on=开关，effort=深度档；默认开 + 档案默认档。

@@ -103,3 +103,88 @@ def test_is_configured_只看config(tmp_path, monkeypatch):
     assert cfg.is_configured() is False                      # .env 配了也不算（单一真相源=config）
     cfg.save_user_config("http://x", "m", "k")
     assert cfg.is_configured() is True                       # config.json 有 model 才算
+
+
+def test_context_cap跟条目走_切后端各用各的(tmp_path, monkeypatch):
+    """8K 窗口的自建模型和 1M 的线上模型，同一个全局上限没法同时合适。
+    顶层那份是"当前后端的"，切后端时被整体重写（_write_user_config 是覆盖不是合并）。
+    compact_threshold 不在此列——那是"我想多早压"的个人偏好，与模型无关。"""
+    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.delenv("MECODE_CONTEXT_CAP", raising=False)
+
+    cfg.save_user_config("http://local/v1", "Qwen3.6", "k", context_cap=8192, compact_threshold=0.6)
+    assert cfg._context_limit("Qwen3.6") == 8192
+    got = cfg.load_user_config()
+    assert got["saved"][0]["context_cap"] == 8192        # 进了条目
+    assert "compact_threshold" not in got["saved"][0]    # 阈值是全局的，不进条目
+
+    # 切到另一个后端（没设上限）→ 顶层那份被重写掉，各用各的，不被 8192 拖累
+    cfg.save_user_config("http://api/v1", "MiniMax-M3", "k")
+    assert cfg._context_limit("MiniMax-M3") == 128_000
+    assert "context_cap" not in cfg.load_user_config()
+
+    # 切回来：条目里的 8192 还在，UI 据此回填并带回顶层
+    e = next(x for x in cfg.saved_configs() if x["model"] == "Qwen3.6")
+    cfg.save_user_config(e["base_url"], e["model"], e["api_key"], context_cap=e["context_cap"])
+    assert cfg._context_limit("Qwen3.6") == 8192
+
+
+def test_update_settings_只改设置项_不动后端(tmp_path, monkeypatch):
+    """/config 里那两个框的行内保存：改个阈值不该被迫走"确定并保存"（那条会热切后端）。
+    上限同步进当前后端的 saved 条目（它跟条目走）；阈值只在顶层（全局偏好）。"""
+    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.delenv("MECODE_CONTEXT_CAP", raising=False)
+    cfg.save_user_config("http://a/v1", "m1", "k1")
+    cfg.save_user_config("http://b/v1", "m2", "k2")            # 当前是 m2
+
+    cfg.update_settings(context_cap=8192)
+    got = cfg.load_user_config()
+    assert (got["base_url"], got["model"], got["api_key"]) == ("http://b/v1", "m2", "k2")  # 后端没动
+    assert got["context_cap"] == 8192
+    assert [e.get("context_cap") for e in got["saved"]] == [None, 8192]   # 只落到当前那条
+
+    cfg.update_settings(compact_threshold=0.5)
+    got = cfg.load_user_config()
+    assert got["compact_threshold"] == 0.5 and got["context_cap"] == 8192  # 另一项不受影响
+    assert all("compact_threshold" not in e for e in got["saved"])         # 阈值不进条目
+
+    cfg.update_settings(context_cap=0)                                     # 0 = 清掉，回默认
+    got = cfg.load_user_config()
+    assert "context_cap" not in got and "context_cap" not in got["saved"][1]
+    assert cfg._context_limit("m2") == 100_000        # 回兜底（m2 未注册，min(100K, CAP 128K)）
+
+
+def test_migrate_context_cap_老的全局上限抄进各条(tmp_path, monkeypatch):
+    """老配置里 context_cap 只在顶层（那时它是全局的）。改成跟条目走之后，一次切后端就会把顶层
+    整体覆盖掉、凭空消失。开窗时迁移一次，之后各条各改各的。幂等。"""
+    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.delenv("MECODE_CONTEXT_CAP", raising=False)
+    cfg.save_user_config("http://a/v1", "m1", "k")
+    cfg.save_user_config("http://b/v1", "m2", "k")
+    import json
+    p = tmp_path / "config.json"
+    d = json.loads(p.read_text(encoding="utf-8"))
+    d["context_cap"] = 100_000                       # 复原"老配置"：只有顶层有
+    p.write_text(json.dumps(d), encoding="utf-8")
+
+    cfg.migrate_context_cap()
+    assert [e["context_cap"] for e in cfg.saved_configs()] == [100_000, 100_000]
+    # 幂等：某条改小后再迁移，不会被顶层那份覆盖回去
+    cfg.update_settings(context_cap=8192, for_backend=("http://a/v1", "m1"))
+    cfg.migrate_context_cap()
+    assert [e["context_cap"] for e in cfg.saved_configs()] == [8192, 100_000]
+
+
+def test_update_settings_可指定写给别的后端(tmp_path, monkeypatch):
+    """切换页可以【不切过去】就改别的模型的上限。顶层那份是"当前后端的副本"，给别人改时不能动它
+    ——否则正在跑的 agent 会用上别人的值。"""
+    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", tmp_path / "config.json")
+    monkeypatch.delenv("MECODE_CONTEXT_CAP", raising=False)
+    cfg.save_user_config("http://a/v1", "m1", "k")
+    cfg.save_user_config("http://b/v1", "m2", "k", context_cap=50_000)   # 当前是 m2
+
+    cfg.update_settings(context_cap=8192, for_backend=("http://a/v1", "m1"))
+    got = cfg.load_user_config()
+    assert got["saved"][0]["context_cap"] == 8192        # 写给了 m1
+    assert got["context_cap"] == 50_000                  # 顶层（当前 m2）没被动
+    assert cfg._context_limit("m2") == 50_000

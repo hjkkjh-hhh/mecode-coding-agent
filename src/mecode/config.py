@@ -41,6 +41,9 @@ def save_user_config(base_url: str, model: str, api_key: str, keep_reasoning: st
                      context_cap: int = 0, compact_threshold: float = 0.0) -> None:
     """把后端写进用户级 config.json（首次引导 / `/config` 用）；目录懒建；key 在任何 repo 之外。
     context_cap / compact_threshold 传 0 = 不写字段（用内置默认）。
+    **context_cap 跟条目走**（同 keep_reasoning）：8K 窗口的自建模型和 1M 的线上模型，同一个全局值
+    没法同时合适——顶层那份是"当前后端的"，切后端时被整体重写（_write_user_config 是覆盖不是合并）。
+    compact_threshold 仍是全局：它是"我想多早压"这种个人偏好，与模型无关。
     每次保存同时把该后端【upsert 进 saved 列表】——配置过的模型都留档（切换页从这里读）。
     upsert 是【原位更新】：重存已有条目只更新字段、不改它在列表里的位置（列表顺序=配置先后，稳定）。"""
     data: dict = {"base_url": base_url, "model": model, "api_key": api_key}
@@ -50,6 +53,7 @@ def save_user_config(base_url: str, model: str, api_key: str, keep_reasoning: st
         entry["keep_reasoning"] = keep_reasoning
     if context_cap:
         data["context_cap"] = context_cap
+        entry["context_cap"] = context_cap      # 跟【条目】走：它是"这个模型用多少上下文"，换后端就该换值
     if compact_threshold:
         data["compact_threshold"] = compact_threshold
     saved = load_user_config().get("saved", [])
@@ -60,6 +64,53 @@ def save_user_config(base_url: str, model: str, api_key: str, keep_reasoning: st
     else:
         saved.append(entry)
     data["saved"] = saved
+    _write_user_config(data)
+
+
+def migrate_context_cap() -> None:
+    """一次性迁移：老配置的 context_cap 只在顶层（那时它是全局的），改成跟条目走之后，
+    一次切后端就会把它整体覆盖掉、凭空消失。这里把它抄进【所有】条目一次，之后各条各改各的。
+    幂等：只要已经有任一条目带了 context_cap 就不再动。"""
+    data = load_user_config()
+    cap, saved = data.get("context_cap"), data.get("saved", [])
+    if not cap or not saved or any(e.get("context_cap") for e in saved):
+        return
+    for e in saved:
+        e["context_cap"] = cap
+    _write_user_config(data)
+
+
+def update_settings(*, context_cap: int | None = None,
+                    compact_threshold: float | None = None,
+                    for_backend: tuple[str, str] | None = None) -> None:
+    """只改设置项，**不动后端三元组、不切后端**（/config 里那两个框的行内保存）。
+    传 None = 该项不动；传 0 = 清掉该项（回内置默认）。
+
+    context_cap 跟条目走：for_backend=(base_url, model) 指定写给【哪一条】（切换页可以不切过去就改
+    别的模型）；不传则写当前后端。只有改的就是当前后端时才同步顶层那份——顶层是"当前后端的副本"，
+    给别人改却动它，会让正在跑的 agent 用上别人的值。
+    compact_threshold 只在顶层，它是与模型无关的全局偏好。"""
+    data = load_user_config()
+    cur = (data.get("base_url"), data.get("model"))
+    target = for_backend or cur
+    if compact_threshold is not None:
+        if compact_threshold:
+            data["compact_threshold"] = compact_threshold
+        else:
+            data.pop("compact_threshold", None)
+    if context_cap is not None:
+        for e in data.get("saved", []):
+            if (e.get("base_url"), e.get("model")) == target:
+                if context_cap:
+                    e["context_cap"] = context_cap
+                else:
+                    e.pop("context_cap", None)
+                break
+        if target == cur:                       # 改的是当前后端 → 顶层那份跟着变
+            if context_cap:
+                data["context_cap"] = context_cap
+            else:
+                data.pop("context_cap", None)
     _write_user_config(data)
 
 
@@ -103,7 +154,11 @@ _DEFAULT_LIMIT = 100_000        # 未知/未注册模型的兜底窗口
 def _context_limit(model: str) -> int:
     """压缩用的上下文上限 = min(模型窗口, CAP)。
     CAP 优先级：config.json context_cap（UI 可设，和后端字段同一真相源）> env MECODE_CONTEXT_CAP > 默认 128K
-    （越低越聪明但压得越勤，越高压得少但推理越钝）。要压测压缩逻辑就把 CAP 设小（如 8000）。"""
+    （越低越聪明但压得越勤，越高压得少但推理越钝）。要压测压缩逻辑就把 CAP 设小（如 8000）。
+
+    注：曾想给每个后端条目加一个自填 context_window（自建/本地模型注册表不认识 → 按兜底 100K 算，
+    压缩永远触发不了）。后来去掉了——最终取的是 min(窗口, CAP)，而 CAP 本来就是 UI 可设的，
+    单后端下"填窗口 8192"和"填上限 8192"完全等价，多一个框只是多一个概念。"""
     from .registry import context_window_for      # 局部 import：registry 不依赖 config，避免顶层耦合
     cap = int(load_user_config().get("context_cap", 0)) or int(os.getenv("MECODE_CONTEXT_CAP", "0")) \
         or _CONTEXT_CAP_DEFAULT

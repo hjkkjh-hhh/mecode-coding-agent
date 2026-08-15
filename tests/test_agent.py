@@ -6,10 +6,13 @@
 （会话存储/单一真相/工具外置见 test_session.py）
 """
 from dataclasses import replace
+from pathlib import Path
+
+import pytest
 
 from mecode.agent import Agent
 from mecode.config import agent_config
-from mecode.events import Done, Notice, ReasoningDelta, TextDelta, ToolCall, Usage
+from mecode.events import Done, Notice, ReasoningDelta, TextDelta, ToolCall, ToolResult, Usage
 from mecode.registry import INERT, KIMI_FORCED, ThinkingProfile
 from mecode.tools import Tool, ToolRegistry, default_registry
 
@@ -358,3 +361,101 @@ def test_switch_backend_历史不被改写_切回CoT无损(tmp_path):
     a.switch_backend(_P(INERT))                                          # 再切完全不认思考的
     assert a.messages[-2]["reasoning_content"] == "想A"                  # 全程无损
     assert a.messages[-1]["reasoning_content"] == "想B"
+
+
+def test_工具结果先记进上下文再发显示事件(tmp_path):
+    """`yield ToolResult` 是生成器交出控制权的点：消费方在那里 close 掉生成器（chat.py 的 Ctrl+C
+    处理就是 gen.close()），后面的 _record 就永远不执行 → 这个 tool_call 变成孤儿 → 被无条件补上
+    [Request interrupted by user]，**而工具其实已经执行成功、文件真改了**，模型据此会再改一遍。
+    先记后发之后 execute→_record 之间没有 yield，关不掉、插不进。七个出口都要守这个顺序。"""
+    import re
+
+    class _CallOnce:
+        def __init__(self):
+            self.n = 0
+
+        def stream(self, messages, tools=None, should_stop=None):
+            self.n += 1
+            if self.n == 1:
+                yield ToolCall(id="c1", name="写点东西", arguments={})
+            else:
+                yield TextDelta("好了")
+            yield Done(reason="tool_calls" if self.n == 1 else "stop")
+
+    副作用 = []
+    reg = ToolRegistry()
+    reg.register(Tool(name="写点东西", description="", parameters={"type": "object", "properties": {}},
+                      handler=lambda a: 副作用.append(1) or "已写盘"))
+    a = Agent(_CallOnce(), reg, system_prompt="x")
+    gen = a.run_turn("改个文件")
+    for ev in gen:
+        if isinstance(ev, ToolResult):
+            gen.close()                       # 模拟"结果刚显示出来就被 Ctrl+C"
+            break
+    assert 副作用 == [1]                       # 工具确实执行了（文件真改了）
+    assert any(m.get("role") == "tool" and m.get("tool_call_id") == "c1" and "已写盘" in m["content"]
+               for m in a.messages), "结果没进上下文 → 下轮会被补成[被打断]，模型会重复执行"
+
+    # 七个出口都得是这个顺序（新增分支照抄反了不会有测试变红，故在源码层守）
+    src = (Path(__file__).resolve().parent.parent / "src" / "mecode" / "agent.py").read_text("utf-8")
+    assert not re.search(r'yield ToolResult\(tc\.name, result, tc\.id\)\n\s*self\._record\(', src), \
+        "有出口写成了先 yield 后 _record"
+
+
+def test_撞上限要往对话里留标记_不只是Notice():
+    """Notice 只给 UI 看、不进 messages。不留标记的话历史停在"调了一堆工具拿到结果然后没下文"，
+    模型下一轮读不出自己是被强制停的 → 要么当已完成、要么从头重做。其余中断出口都记了。"""
+    class _永远调工具:
+        def stream(self, messages, tools=None, should_stop=None):
+            yield ToolCall(id="c", name="空转", arguments={})
+            yield Done(reason="tool_calls")
+
+    reg = ToolRegistry()
+    reg.register(Tool(name="空转", description="", parameters={"type": "object", "properties": {}},
+                      handler=lambda a: "ok"))
+    a = Agent(_永远调工具(), reg, system_prompt="x", config=replace(agent_config, max_iterations=3))
+    evs = list(a.run_turn("干活"))
+    assert any(isinstance(e, Notice) and "强制停止" in e.text for e in evs)     # UI 看得到
+    assert any(m["role"] == "user" and "最大工具调用次数" in m.get("content", "")
+               for m in a.messages), "对话里没留标记 → 模型不知道自己被砍了"
+
+
+def test_流中途断_已产出的正文要进对话历史():
+    """流式是边收边显示的：断的时候那半句【已经在用户屏幕上了】，而 _record 在流循环之后 →
+    异常一抛就跳过，模型下次看不到自己说过什么，用户说"继续"它会从头再说一遍（屏幕上内容重复）。
+    与 A3 同一个家族：副作用已发生、记录没跟上。重试不做——流式重来会把已产出 token 重复一遍。"""
+    class _流断:
+        def stream(self, messages, tools=None, should_stop=None):
+            yield ReasoningDelta("先想一下")
+            yield TextDelta("我先说前半句")
+            raise ConnectionError("连接被重置")
+
+    a = Agent(_流断(), ToolRegistry(), system_prompt="x")
+    显示 = ""
+    with pytest.raises(ConnectionError):          # 报错行为不变，照旧往上抛
+        for ev in a.run_turn("帮我分析"):
+            if isinstance(ev, TextDelta):
+                显示 += ev.text
+    asst = [m for m in a.messages if m.get("role") == "assistant"]
+    assert len(asst) == 1 and asst[0]["content"] == 显示 == "我先说前半句"
+    assert asst[0].get("reasoning_content") == "先想一下"        # 正文非空时思考一并留（发送时按档案过滤）
+    assert not asst[0].get("tool_calls")
+
+
+def test_只出了思考就断_不补空消息():
+    """content="" 的补记是负收益：发送时 reasoning 按档案被剥掉（多数模型只收到光秃秃的空 assistant），
+    而它还会顶掉压缩里"硬保留最后一轮 assistant 原文"的位置——_last_content 撞到空串就 return None，
+    等于拿一条没内容的把有内容的挤掉。也与"空响应不记录空回合"的既有决定相悖。"""
+    class _只思考就断:
+        def stream(self, messages, tools=None, should_stop=None):
+            yield ReasoningDelta("我在想")
+            raise ConnectionError("断了")
+
+    a = Agent(_只思考就断(), ToolRegistry(), system_prompt="x")
+    a.messages.append({"role": "assistant", "content": "上一轮的完整结论"})
+    with pytest.raises(ConnectionError):
+        list(a.run_turn("问题"))
+    assert [m for m in a.messages if m.get("role") == "assistant"] == [
+        {"role": "assistant", "content": "上一轮的完整结论"}]        # 没多出空消息
+    from mecode.compact import _last_content
+    assert _last_content(a.messages, "assistant") == "上一轮的完整结论"   # 保留位没被顶掉

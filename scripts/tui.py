@@ -47,7 +47,8 @@ from mecode.agent import Agent                           # noqa: E402
 from mecode.compact import estimate_tokens               # noqa: E402
 from mecode.config import (                              # noqa: E402
     _CONTEXT_CAP_DEFAULT, agent_config, current_agent_config, current_backend,
-    delete_saved, env_backend, load_user_config, save_user_config, saved_configs,
+    delete_saved, env_backend, load_user_config, migrate_context_cap, save_user_config,
+    saved_configs, update_settings,
 )
 from mecode.events import (                              # noqa: E402
     Notice, PlanProposed, ReasoningDelta, TextDelta, ToolResult, ToolStarted, Usage,
@@ -1889,7 +1890,10 @@ class ConfigScreen(ModalScreen):
     .cfg-subtab:hover { background: white 25%; }
     /* 两个 tab 面板共用这块【定高】区：切 tab 不跳。高度取各态最高的一态(手动页+思维链选项≈18)；
        preset 页把模型列表放高、正好填满同样高度 → 既不裁手动页选项、preset 页也没有空隙。 */
-    #cfg-body { height: 18; }
+    /* 按内容自适应。曾写死 18 行（按最高的"一键页"定的），于是切换页只有一个列表（5 条≈8 行）时
+       白占 10 行，底部按钮被推到老远。代价：切页时弹窗高度会变（各页内容 8~15 行不等）——
+       比一大片空白可接受。*/
+    #cfg-body { height: auto; }
     #cfg-preset { height: auto; }
     #cfg-saved { height: auto; }
     #cfg-saved-list { height: auto; max-height: 14; border: round $panel; }
@@ -1902,7 +1906,12 @@ class ConfigScreen(ModalScreen):
     .cfg-del.-armed:hover { background: $error-lighten-1; }
     #cfg-models { height: auto; max-height: 11; border: round $panel; }
     #cfg-keyhint { color: $text-muted; height: auto; }
-    #cfg-adv { height: auto; margin-top: 1; }
+    #cfg-adv { height: auto; }   /* 不留 margin：第一项是标签，紧贴上一块即可 */
+    .cfg-row { height: auto; }
+    .cfg-row Input { width: 1fr; }
+    .cfg-inline-save { width: auto; padding: 0 2; margin-top: 1; margin-left: 2; display: none;
+                       background: $success; color: black; text-style: bold; border: solid $success; }
+    .cfg-inline-save:hover { background: $success-lighten-1; border: solid $success-lighten-1; }
     ConfigScreen Input { margin-top: 1; }
     #cfg-msg { color: $text-error; height: auto; }
     #cfg-actions { height: auto; margin-top: 1; }
@@ -1928,8 +1937,14 @@ class ConfigScreen(ModalScreen):
         super().__init__()
         self._tab = "preset"
         self._models = [(p, m) for p in PROVIDERS for m in p.models]   # 扁平 (provider, model)
-        self._keep_reasoning = ""   # manual 模式下未知模型的思维链保留方式
+        # manual 模式下未知模型的思维链保留方式。默认跟 registry.INERT 一致（工具调用回合保留）；
+        # 显式关掉存哨兵 "none" 而不是 ""——空串同时也是"从没设过"，两者混一起的话，改了默认之后
+        # 用户点的"不保留"会落回默认，等于开关点了没反应（见 provider.__init__）。
+        self._keep_reasoning = "tool_calls"
+        self._cap_target: tuple[str, str] | None = None   # 上限框此刻指向哪个后端（None=当前后端）
+        self._cap_base = ""                                # 该后端存着的上限（保存钮的比对基准）
         self._add_sub = "preset"    # 新增页当前停留的子页（一键/手动）；切回"新增"时恢复
+        migrate_context_cap()                 # 老配置：顶层的全局上限抄进各条（幂等），否则切一次就没了
         self._saved = self._collect_saved()   # 已配置过的后端（只读 config.json）
         self._env: dict = {}        # .env 检测到且 config 没有的后端（on_mount 填；"点此加载"用）
 
@@ -1972,17 +1987,27 @@ class ConfigScreen(ModalScreen):
                     yield Input(placeholder="API Key", password=True, id="cfg-mkey")
                     with Vertical(id="cfg-think"):
                         yield Static("该模型不在内置列表，请选择思维链在上下文中的保留方式：", id="cfg-think-hint", classes="cfg-lbl")
+                        # 默认选中"工具调用时保留"：多数模型现在默认就在思考，思考链也收得到，
+                        # 剥掉等于每轮让它丢失自己上一步的推理（同 registry.INERT 的默认）。
                         with Horizontal(id="cfg-think-opts"):
-                            yield _CfgClick("不保留", "_set_keep_none", classes="cfg-opt -on")
+                            yield _CfgClick("不保留", "_set_keep_none", classes="cfg-opt")
                             yield _CfgClick("全部保留", "_set_keep_all", classes="cfg-opt")
-                            yield _CfgClick("工具调用时保留", "_set_keep_tool", classes="cfg-opt")
+                            yield _CfgClick("工具调用时保留", "_set_keep_tool", classes="cfg-opt -on")
                     with Vertical(id="cfg-think-auto"):
                         yield Static("", id="cfg-think-auto-text", classes="cfg-auto-msg")
             with Vertical(id="cfg-adv"):
-                yield Static("有效上下文上限（token，越低越省/压得越勤；不填则默认 128000）：", classes="cfg-lbl")
-                yield Input(placeholder=str(_CONTEXT_CAP_DEFAULT), id="cfg-cap")
+                # 两项各配一个【行内保存】按钮：改了值才出现，点它只落这一项、不切后端、不关窗。
+                # 否则想改个阈值也得走"确定并保存"，那条路是按"新增/切换模型"设计的（会热切后端）。
+                yield Static("该模型的有效上下文上限（token，越低越省/压得越勤；不填则默认 128000）：",
+                             classes="cfg-lbl")
+                with Horizontal(classes="cfg-row"):
+                    yield Input(placeholder=str(_CONTEXT_CAP_DEFAULT), id="cfg-cap")
+                    yield _CfgClick("保存", "_save_cap", id="cfg-cap-save", classes="cfg-inline-save")
                 yield Static("压缩触发阈值（占上限几成就压，0~1；不填则默认 0.7）：", classes="cfg-lbl")
-                yield Input(placeholder="0.7", id="cfg-thresh")
+                with Horizontal(classes="cfg-row"):
+                    yield Input(placeholder="0.7", id="cfg-thresh")
+                    yield _CfgClick("保存", "_save_thresh", id="cfg-thresh-save",
+                                    classes="cfg-inline-save")
             yield Static("", id="cfg-msg")
             with Horizontal(id="cfg-actions"):
                 yield _CfgClick("取消", "action_cancel", classes="cfg-cancel")
@@ -2015,10 +2040,10 @@ class ConfigScreen(ModalScreen):
         if len(self._saved) >= 2 or self._env:   # 存了俩以上 / .env 有待导入模型 → 直接落切换页
             self._set_tab("saved")
         cfg = load_user_config()                             # 高级项：已存过就回填当前值，否则留 placeholder
-        if cfg.get("context_cap"):
-            self.query_one("#cfg-cap", Input).value = str(cfg["context_cap"])
         if cfg.get("compact_threshold"):
             self.query_one("#cfg-thresh", Input).value = str(cfg["compact_threshold"])
+        # 上限框指向当前后端（切到切换页时会改指高亮那一条）；同时置好保存钮的基准
+        self._load_cap_box()
 
     def _fill_saved_list(self) -> None:
         """填/重填切换页列表（只读 config.json）。每行 = 模型名+窗口（撑满）+ 右侧 ✕ 删除。"""
@@ -2040,6 +2065,8 @@ class ConfigScreen(ModalScreen):
             empty.update("")
         else:
             empty.update("（还没有已保存的模型；先在「新增模型」页配置一个）")
+        # 空文案时整个收掉：内容高度是 0，但 margin-top 照占一行，白留一条缝
+        empty.display = not self._saved
 
     def _delete_saved(self, entry: dict) -> None:
         """删一条已保存配置（config.json saved 列表），当场重填列表。"""
@@ -2086,8 +2113,12 @@ class ConfigScreen(ModalScreen):
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         idx = event.list_view.index
-        if idx is not None and event.list_view.id == "cfg-models":   # keyhint 只跟一键页的模型列表
+        if idx is None:
+            return
+        if event.list_view.id == "cfg-models":                       # keyhint 只跟一键页的模型列表
             self._update_keyhint(idx)
+        elif event.list_view.id == "cfg-saved-list" and idx < len(self._saved):
+            self._load_cap_box(self._saved[idx])   # 上限框跟着高亮那一条走（保存也写给它）
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         """切换页列表【Enter / 点选】即确定切换（选中就是意图，别再点一次按钮）。"""
@@ -2102,7 +2133,52 @@ class ConfigScreen(ModalScreen):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "cfg-model":
             self._check_model(event.value.strip())
+        if event.input.id in ("cfg-cap", "cfg-thresh"):
+            self._refresh_inline_save()
         self._refresh_test_visible()
+
+    def _load_cap_box(self, entry: dict | None = None) -> None:
+        """把上限框指向某个后端并填上它的值。entry=None → 当前后端（顶层那份）。
+        **框显示谁的，保存就写给谁** —— 两者必须同源，否则会出现"看着是 A 的值、存到了 B 头上"
+        （真出过：框跟着高亮走、保存却写当前后端，一比对基准就错位，没改也冒保存钮）。"""
+        self._cap_target = (entry["base_url"], entry["model"]) if entry else None
+        val = str((entry or load_user_config()).get("context_cap") or "")
+        self._cap_base = val
+        self.query_one("#cfg-cap", Input).value = val
+        self._refresh_inline_save()
+
+    def _refresh_inline_save(self) -> None:
+        """值和基准不一样才显示保存钮——没改就别摆个按钮在那儿让人以为没保存。"""
+        th_s = str(load_user_config().get("compact_threshold") or "")
+        self.query_one("#cfg-cap-save").display = \
+            self.query_one("#cfg-cap", Input).value.strip() != self._cap_base
+        self.query_one("#cfg-thresh-save").display = \
+            self.query_one("#cfg-thresh", Input).value.strip() != th_s
+
+    def _save_cap(self) -> None:
+        self._save_adv(cap_only=True)
+
+    def _save_thresh(self) -> None:
+        self._save_adv(cap_only=False)
+
+    def _save_adv(self, *, cap_only: bool) -> None:
+        """行内保存：只落这一项，不动后端三元组、不切后端、不关窗。
+        上限跟【当前后端条目】走（见 config.update_settings）；阈值是全局偏好。"""
+        cap, thresh = self._parse_adv()
+        if _INVALID in (cap, thresh):
+            return    # _parse_adv 已报错（两项一起校验：另一项填错了也该先让用户看见）
+        if cap_only:
+            update_settings(context_cap=cap, for_backend=self._cap_target)
+            self._cap_base = str(cap or "")
+            self._saved = self._collect_saved()      # 条目里的值变了，列表数据源跟着刷
+        else:
+            update_settings(compact_threshold=thresh)
+        self._refresh_inline_save()
+        app = self.app
+        if hasattr(app, "_apply_settings_change"):
+            app._apply_settings_change()          # 让正在跑的 agent 立刻用上新值，不必重启/切后端
+        self.query_one("#cfg-msg", Static).update(
+            Text("✓ 已保存" + ("上下文上限" if cap_only else "压缩阈值"), style="green"))
 
     def _refresh_test_visible(self) -> None:
         """"测试连接"按钮只在当前页信息齐了才显示：一键=填了 key；手动=三项全填；切换=有可选条目。"""
@@ -2138,7 +2214,7 @@ class ConfigScreen(ModalScreen):
             think_auto.display = False
 
     def _set_keep_none(self) -> None:
-        self._keep_reasoning = ""
+        self._keep_reasoning = "none"     # 哨兵：显式关掉（"" 会被当成"没设过"、吃默认）
         self._update_keep_opt(0)
 
     def _set_keep_all(self) -> None:
@@ -2165,15 +2241,21 @@ class ConfigScreen(ModalScreen):
         if got is None:
             return    # _resolve_backend 已报错
         base, model, key = got
+        cap, thresh = self._parse_adv()
+        if _INVALID in (cap, thresh):
+            return    # _parse_adv 已报错
         if self._tab == "saved":
-            keep = self._saved[self.query_one("#cfg-saved-list", ListView).index].get("keep_reasoning", "")
+            e = self._saved[self.query_one("#cfg-saved-list", ListView).index]
+            keep = e.get("keep_reasoning", "")
+            # 切换页用【那条自己的上限】，不看输入框——框里装的是"当前后端"的值（配行内保存钮用），
+            # 拿它去存另一个后端就是把当前后端的设置抄到别人头上。
+            # 没单独设过就是没设过（0 = 回默认）。老配置"上限只在顶层"的情况由 migrate_context_cap
+            # 在开窗时一次性抄进各条，不在这里沿用当前值——那会把一个值传染给切过的每一条。
+            cap = int(e.get("context_cap") or 0)
         elif self._tab == "preset":
             keep = self._models[self.query_one("#cfg-models", ListView).index][1].profile.keep_reasoning
         else:
             keep = self._keep_reasoning
-        cap, thresh = self._parse_adv()
-        if cap is _INVALID or thresh is _INVALID:
-            return    # _parse_adv 已报错
         from_add = self._tab in ("preset", "manual")
         save_user_config(base, model, key, keep_reasoning=keep,
                          context_cap=cap, compact_threshold=thresh)
@@ -3113,6 +3195,13 @@ class MecodeApp(App):
                         batch=False)
         else:
             self._apply_backend_switch()
+
+    def _apply_settings_change(self) -> None:
+        """只改了上限/阈值（行内保存）：让【正在跑的】agent 立刻用上新值。
+        不走 _apply_backend_switch——那条会重建 Provider 并把思考态重置回档案默认，
+        而这里后端根本没换，重置是无谓的副作用。"""
+        self.agent.config = current_agent_config()
+        self.query_one("#status-info", Static).update(self._status_text())
 
     def _apply_backend_switch(self) -> None:
         """按此刻的 config.json 热切后端：新 Provider（带新模型思考档案）+ 新 AgentConfig（上限/阈值随新模型），

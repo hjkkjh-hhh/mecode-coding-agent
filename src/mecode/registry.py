@@ -72,8 +72,14 @@ MINIMAX_M3 = ThinkingProfile(supports_thinking=True, toggleable=True, on_value="
 MINIMAX_FORCED = ThinkingProfile(supports_thinking=True, toggleable=False, on_value="adaptive",
                                  reasoning_split=True, keep_reasoning="all")
 
-# 默认档：不发 thinking、不回传 reasoning_content → 未注册/自填未命中的模型（本地 vLLM、Qwen 等）零回归。
-INERT = ThinkingProfile()
+# 默认档（未注册/自填未命中的模型，如本地 vLLM、Qwen）：
+# 【不发 thinking 参数】——各家形态互不相通（enabled/adaptive/reasoning_effort/reasoning_split），
+#   往不认识的后端塞一个就是 400（vLLM 的 pydantic 校验直接拒），不发是唯一安全的默认。
+# 【但回传 reasoning_content】——多数模型现在默认就在思考，思考链也确实收得到（_consume 无条件读
+#   reasoning_content，四家通用载体）。剥掉它等于每轮都让模型丢失自己上一步的推理。
+#   回传不存在"猜错字段"的风险：那是【后端自己发过来的】字段，它没发历史里就没有、也就无从回传。
+#   要显式关掉：/config 手动页选"不保留"（存哨兵 "none"，见 provider.__init__）。
+INERT = ThinkingProfile(keep_reasoning="tool_calls")
 
 
 @dataclass(frozen=True)

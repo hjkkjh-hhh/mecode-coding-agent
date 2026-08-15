@@ -459,6 +459,14 @@ class Agent:
             iterations += 1
             if iterations > self.config.max_iterations:
                 yield Notice(f"已达最大循环 {self.config.max_iterations} 次，强制停止")
+                # 也要往【对话】里留一条：Notice 只给 UI 看，不进 messages。不留的话历史停在
+                # "调了一堆工具拿到结果然后没下文"，模型下一轮读不出自己是被强制停的——要么当
+                # 已完成、要么从头重做（有写操作就是重复写）。其余中断出口（打断/后台完成/压缩）
+                # 都记了，唯独这个漏了。
+                self._record({"role": "user", "content": _reminder(
+                    f"本轮已达最大工具调用次数（{self.config.max_iterations}）被强制停止，"
+                    f"任务可能只做了一半。不要假设已完成——先向用户说明做到哪一步、还剩什么，"
+                    f"等用户指示。")})
                 return
 
             self._inject_bg_events()        # 每次调模型【前】清后台事件：完成 + 到点的 check-in
@@ -468,20 +476,37 @@ class Agent:
             tool_calls: list[ToolCall] = []  # 本次模型要调的工具
 
             # ① 调模型，消费 Provider 事件：思考/正文透传给上层，工具调用先收集
-            for ev in self.provider.stream(self.messages, self.tools.schemas(),
-                                           should_stop=self._interrupt.is_set):
-                match ev:
-                    case ReasoningDelta(text=rt):
-                        reasoning += rt      # 累积思考（回传 reasoning_content 用）
-                        yield ev
-                    case TextDelta(text=t):
-                        text += t            # 累积正文（用于写回对话历史）
-                        yield ev
-                    case ToolCall():
-                        tool_calls.append(ev)
-                    case Usage(prompt_tokens=pt):
-                        self.context_tokens = pt   # 记下这次请求的精确上下文大小
-                        yield ev                   # 透传：TUI 状态栏可实时显示 token
+            try:
+                for ev in self.provider.stream(self.messages, self.tools.schemas(),
+                                               should_stop=self._interrupt.is_set):
+                    match ev:
+                        case ReasoningDelta(text=rt):
+                            reasoning += rt      # 累积思考（回传 reasoning_content 用）
+                            yield ev
+                        case TextDelta(text=t):
+                            text += t            # 累积正文（用于写回对话历史）
+                            yield ev
+                        case ToolCall():
+                            tool_calls.append(ev)
+                        case Usage(prompt_tokens=pt):
+                            self.context_tokens = pt   # 记下这次请求的精确上下文大小
+                            yield ev                   # 透传：TUI 状态栏可实时显示 token
+            except (KeyboardInterrupt, GeneratorExit, _TurnInterrupted):
+                raise                            # 打断有自己的出口（下方 except），别在这里插手
+            except Exception:
+                # 流中途断（网络重置/服务端掐断）：已产出的正文【已经显示给用户了】，但记录在循环之后，
+                # 异常一抛就跳过 → 用户说"继续"时模型不知道自己说过那半句，会从头再说一遍。
+                # 先补记再抛：报错行为不变，只是别把已发生的事丢了。（重试不做——流式重来会把已产出的
+                # token 重复一遍，provider 那边是刻意不重试的。）
+                # 【只在正文非空时补】：只出了思考的话，补的是一条 content="" 的空消息——发送时
+                # reasoning 会按档案被剥掉（多数模型收到的是光秃秃的空 assistant），而它还会顶掉压缩
+                # 里"硬保留最后一轮 assistant 原文"的位置（_last_content 撞到空串就 return None），
+                # 等于拿一条没内容的把有内容的挤掉；也与下方"空响应不记录空回合"的既有决定相悖。
+                # tool_calls 传 []：provider 读完整个流才 flush ToolCall，半截调用根本到不了这里，
+                # 此时 tool_calls 本就是空的。
+                if text.strip():
+                    self._record(self._assistant_msg(text, [], reasoning=reasoning))
+                raise
 
             if self._interrupt.is_set():     # 流式被打断（provider 已提前停）→ 走统一打断处理
                 raise _TurnInterrupted
@@ -566,8 +591,8 @@ class Agent:
         yield ToolStarted(tc.name, tc.arguments, tc.id)
         if not allowed:                      # 被拒：明确叫停（文案见 _DENY_TOOL / _DENY_NO_APPROVER）
             result = (_DENY_NO_APPROVER if no_approver else _DENY_TOOL).format(name=tc.name)
-            yield ToolResult(tc.name, result, tc.id)
             self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
+            yield ToolResult(tc.name, result, tc.id)
             return
         if tc.name == "exit_plan":           # 控制类工具：Agent 亲自处理（落盘计划 + 发事件 + 结束本轮），不走注册表
             yield from self._exec_exit_plan(tc)
@@ -576,8 +601,8 @@ class Agent:
         bg = None if self._is_subagent else self._bg
         full = self.tools.execute(tc.name, tc.arguments, slot=self._proc_slot, bg=bg)
         result = self._process_result(tc.name, full)
-        yield ToolResult(tc.name, result, tc.id)
         self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
+        yield ToolResult(tc.name, result, tc.id)
 
     def _exec_exit_plan(self, tc: ToolCall) -> Iterator[Event]:
         """exit_plan（无参）：读【计划文件】呈交。仅计划模式生效——发 PlanProposed 让上层渲染+弹审批条，
@@ -585,8 +610,8 @@ class Agent:
         本工具只负责呈交，故计划正文不进工具参数（修订用 edit_file 增量、历史无冗余全量）。"""
         if self.mode != "plan":
             result = "当前不是计划模式，无需提交计划；请直接进行你要做的操作。"
-            yield ToolResult(tc.name, result, tc.id)
             self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
+            yield ToolResult(tc.name, result, tc.id)
             return
         plan, path = "", None
         if self.store is not None and self.store.plan_path.is_file():
@@ -594,14 +619,14 @@ class Agent:
             path = self.store.plan_path.as_posix()
         if not plan.strip():                 # 还没写计划文件 → 不结束本轮，提示先写
             result = "还没有计划内容——请先用 write_file 把完整计划写进计划文件，写好再调 exit_plan 提交。"
-            yield ToolResult(tc.name, result, tc.id)
             self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
+            yield ToolResult(tc.name, result, tc.id)
             return
         self._plan_pending = True
         yield PlanProposed(plan, path)
         result = "计划已提交给用户审阅。现在停下，等用户批准或给修改意见——别自行开始动手。"
-        yield ToolResult(tc.name, result, tc.id)
         self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
+        yield ToolResult(tc.name, result, tc.id)
 
     def _exec_subagents_parallel(self, subs: list[ToolCall]) -> Iterator[Event]:
         """前台 subagent 批【并发】执行（见 _exec_parallel_batch）。不设并发上限：
@@ -629,8 +654,8 @@ class Agent:
             yield ToolStarted(tc.name, tc.arguments, tc.id)
             if not allowed:
                 result = (_DENY_NO_APPROVER if no_approver else deny_msg).format(name=tc.name)
-                yield ToolResult(tc.name, result, tc.id)
                 self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
+                yield ToolResult(tc.name, result, tc.id)
             else:
                 runnable.append(tc)
         if not runnable:
@@ -645,8 +670,8 @@ class Agent:
                 except Exception as e:      # 单个崩了不拖垮整批：把错误当结果喂回
                     full = f"工具 {tc.name} 执行出错：{type(e).__name__}: {e}"
                 result = self._process_result(tc.name, full)
-                yield ToolResult(tc.name, result, tc.id)
                 self._record({"role": "tool", "tool_call_id": tc.id, "content": result})
+                yield ToolResult(tc.name, result, tc.id)
 
     def _on_compacted(self, image: list[dict]) -> None:
         """压缩完成回调（compact 注入）：把 compaction marker 写进 transcript。

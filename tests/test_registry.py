@@ -67,11 +67,14 @@ def test_minimax_M3可开关_M2_7强制_都adaptive_split_all():
     assert MINIMAX_FORCED.toggleable is False   # M2.7 强制开
 
 
-def test_未知模型_inert_不支持思考_不保留():
+def test_未知模型_inert_不发思考参数_但保留思考链():
+    """两件事分开：**发参数**要保守（各家形态互不相通，往不认识的后端塞一个就是 400）；
+    **回传思考链**不必保守——那是后端自己发过来的 reasoning_content，它没发历史里就没有，
+    无从发错。剥掉它等于每轮让模型丢失自己上一步的推理。"""
     prof = profile_for("Qwen3.6")
     assert prof is INERT
-    assert prof.supports_thinking is False     # 不发 thinking
-    assert prof.keep_reasoning == ""           # 不回传 reasoning
+    assert prof.supports_thinking is False           # 不发 thinking
+    assert prof.keep_reasoning == "tool_calls"       # 但工具调用回合的思考链带回去
 
 
 def test_seed_四家():
