@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Callable
 
 # ---- 本地 token 估算（usage 缺失时的兜底） ----
@@ -213,18 +214,51 @@ def _last_content(old: list[dict], role: str) -> str | None:
     return None
 
 
+def _rescue_key(name: str, args: str) -> tuple:
+    """救援去重的键 = (工具名, 归一化路径, offset, limit)，凑不出路径就退回参数原文。
+
+    不拿参数原文当键：同一文件两种写法、参数顺序不同都会算成两个键（都实测撞到过）。
+    按【区间】而非按【文件】去重（曾按文件，实测推翻）：按文件时正在攻坚的那个文件只留
+    最近一个窗口，压缩后头 3 轮 read_file 频率飙到平均的 2.26 倍——模型立刻重读回来。
+
+    第二个返回值是归一化路径（取不出则 None），给 _rescue_reads 数"几个不同文件"用。
+    """
+    try:
+        a = json.loads(args) or {}
+        p = a.get("path")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        a, p = {}, None
+    if not p:
+        return (name, args), None
+    try:
+        norm = Path(p).resolve().as_posix()
+    except OSError:                        # 路径非法/不可解析 → 退回原样，别抛
+        norm = str(p)
+    return (name, norm, a.get("offset"), a.get("limit")), norm
+
+
 def _rescue_reads(
-    old: list[dict], read_tools: tuple[str, ...], count: int
+    old: list[dict], read_tools: tuple[str, ...], count: int,
+    max_tokens: int = 0, max_files: int = 0,
 ) -> list[tuple[str, str, str]]:
-    """倒序单趟捞最近 count 个 read 工具调用，按(工具名,参数)去重留最新。最早在前返回。
+    """倒序单趟捞最近读过的【max_files 个文件】的全部区间。最早在前返回。
+
+    三把闸各管一件事，都可配 0 关掉：
+      max_files  —— 最多涉及几个不同文件。倒着走，已收满后再遇到【新】文件就跳过，
+                    但已收文件的更早区间照收——即"最近 N 个文件的全部读取都留下"。
+      max_tokens —— 总量 token 预算，从最新往回收，耗尽即停。【至少保留一条】，
+                    否则压缩后模型手里一份原文都没有。
+      count      —— 条目数上限，默认 0（不限）。留给测试。
 
     关键：倒着走时一个调用的【结果(tool 消息)】先出现、【调用(assistant 消息)】后出现
     （正序“调用→结果”反过来就是“结果→调用”）。所以先把见到的结果暂存 id→内容，
-    遇到对应调用时内容已在手边，直接取、去重；凑够 count 即退出，长历史不必扫全程。
+    遇到对应调用时内容已在手边，直接取、去重。
     """
     result_by_id: dict[str, str] = {}      # 暂存：tool_call_id → 文件原文
-    seen: set[tuple[str, str]] = set()     # 已收的 (工具名, 参数)，去重留最新
+    seen: set[tuple] = set()               # 已收的区间键，去重留最新
+    files: list[str] = []                  # 已收的不同文件（按从新到旧的相遇顺序）
     deduped: list[tuple[str, str, str]] = []
+    used = 0
     for m in reversed(old):
         if m.get("role") == "tool":
             result_by_id[m.get("tool_call_id")] = m.get("content") or ""
@@ -232,13 +266,24 @@ def _rescue_reads(
         for tc in m.get("tool_calls") or []:
             fn = tc.get("function") or {}
             name, args = fn.get("name") or "", fn.get("arguments") or ""
-            key = (name, args)
+            key, path = _rescue_key(name, args)
             if name in read_tools and key not in seen and tc.get("id") in result_by_id:
+                is_new_file = path is not None and path not in files
+                if is_new_file and max_files and len(files) >= max_files:
+                    continue                            # 文件数已满：跳过新文件，继续收已收文件的更早区间
+                content = result_by_id[tc.get("id")]
+                if max_tokens and deduped:              # 第一条无条件收，之后才看预算
+                    cost = estimate_tokens([{"role": "tool", "content": content}])
+                    if used + cost > max_tokens:
+                        return list(reversed(deduped))  # 预算耗尽：更早的不再保留
+                    used += cost
                 seen.add(key)
-                deduped.append((name, args, result_by_id[tc.get("id")]))
-                if len(deduped) >= count:
+                if is_new_file:
+                    files.append(path)
+                deduped.append((name, args, content))
+                if count and len(deduped) >= count:
                     break
-        if len(deduped) >= count:
+        if count and len(deduped) >= count:
             break
     return list(reversed(deduped))         # 还原成最早在前
 
@@ -248,7 +293,9 @@ def compact(
     messages: list[dict],
     *,
     read_tools: tuple[str, ...] = ("read_file",),
-    rescue_count: int = 5,
+    rescue_count: int = 0,
+    rescue_max_tokens: int = 0,
+    rescue_max_files: int = 0,
     transcript_pointer: str | None = None,
     on_compacted: Callable[[list[dict]], None] | None = None,
     claude_md: str | None = None,
@@ -311,7 +358,8 @@ def compact(
         rebuilt.append({"role": "assistant", "content": _reminder(last_asst)})
 
     # 3) 最近 N 个 read：每个拆成“调用提示 + 文件原文”两条 user 消息
-    for name, args, content in _rescue_reads(old, read_tools, rescue_count):
+    for name, args, content in _rescue_reads(old, read_tools, rescue_count,
+                                             rescue_max_tokens, rescue_max_files):
         rebuilt.append({"role": "user", "content":
             _reminder(f"调用了 {name} 工具，输入如下：{args}")})
         rebuilt.append({"role": "user", "content": _reminder(content)})

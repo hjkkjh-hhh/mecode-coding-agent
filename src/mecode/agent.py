@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import threading
+from pathlib import Path
 from typing import Callable, Iterator
 
 from .background import BackgroundManager, background_tools
@@ -33,7 +34,21 @@ from .session import SessionStore
 from .tools import ProcSlot, ToolRegistry, truncate_output
 
 MAX_EMPTY_RETRIES = 2        # 空响应最多重试几次再放弃
+# 轮【内】压缩后注入的续跑说明。必须点明"不是用户打断"：历史被换成摘要后，模型看到的是
+# 一段陌生的总结 + 一条 user 消息，很容易读成"用户插话叫停了"，从而停下来问用户要什么。
+_COMPACT_RESUME = (
+    "上下文接近上限，系统自动把上面的历史压成了摘要。这不是用户打断你，用户没有新指示。"
+    "你原来的任务没有变，请根据摘要接着做下去，不要重新开始、也不要向用户复述已完成的部分。"
+)
 MAX_PARALLEL_READS = 8       # 连续只读工具组的并发上限（一批几十个 grep/glob 不至于起线程风暴）
+
+# 长时间没落到源码上时的提示。措辞不做事实断言：计数器只看 edit_file/write_file，
+# 走 bash（sed -i）改的看不见；只读任务零修改跑很多轮也正常——所以给边界、明说可忽略。
+_NO_EDIT_REMINDER = (
+    "最近 {n} 轮工具调用没有修改工作目录下的文件。如果当前任务需要改代码，可以确认一下"
+    "是否已经收敛到具体的改动方案，还是仍在反复探索。这只是一条提示——"
+    "任务本身不需要改代码（阅读、调查、回答问题等）就忽略它。"
+)
 
 # 拒绝执行的统一文案（明确叫停，否则模型常换命令/工具反复重试、刷屏空转）
 _DENY_TOOL = ("错误：用户拒绝执行工具 {name}。不要重试或换工具绕过该操作；"
@@ -271,6 +286,43 @@ class Agent:
         if self.store is not None:
             self.store.write_header(context_tokens=self.context_tokens)
 
+    def _maybe_compact(self, resume_hint: str = "") -> Iterator[Event]:
+        """上下文超阈值就把旧历史压成摘要。轮开头（_pre_turn）和工具循环内（_turn_loop）共用。
+
+        优先用上次请求返回的精确 prompt_tokens 判断（token 只有请求后才知道，故用上次的值）；
+        为 0 时（后端不回 usage / 刚压缩完）用本地字符粗估兜底——否则不回 usage 的后端永不触发压缩。
+        resume_hint：轮【内】压缩要追加的续跑说明（轮开头不用——用户消息随后就到，模型不会迷路）。
+
+        压缩后那几件事（换 messages、重置 token 计数、重注任务清单）写在这一处：两条调用路径
+        各写各的，迟早漏掉其中一件。"""
+        tokens = self.context_tokens or estimate_tokens(self.messages, self.tools.schemas())
+        if tokens <= self.config.compact_threshold * self.config.context_limit:
+            return
+        compacted = compact(
+            self._summarize, self.messages,
+            read_tools=tuple(
+                t.strip() for t in self.config.rescue_read_tools.split(",") if t.strip()
+            ),
+            rescue_count=self.config.rescue_read_count,
+            rescue_max_tokens=self.config.rescue_read_max_tokens,
+            rescue_max_files=self.config.rescue_read_max_files,
+            transcript_pointer=(self.store.transcript_path.as_posix()
+                                if self.store is not None else None),
+            on_compacted=self._on_compacted,
+        )
+        if compacted is None:
+            return
+        self.messages = compacted
+        yield Notice(f"上下文 {'' if self.context_tokens else '约'}{tokens} tokens 接近上限，已压缩旧历史")
+        self.context_tokens = 0   # 压缩后重置，等下次请求测得新值
+        # 任务清单是带外状态（存 tasks.json、不在被压的历史里）。压缩可能把 task_* 调用折叠掉，
+        # 这里把当前清单快照重新注入一条，确保模型压缩后仍看得见自己的清单（侧栏始终在、不受影响）。
+        snap = self._tasks.render_reminder()
+        if snap:
+            self._record({"role": "user", "content": _reminder(snap)})
+        if resume_hint:
+            self._record({"role": "user", "content": _reminder(resume_hint)})
+
     def _pre_turn(self) -> Iterator[Event]:
         """每轮开头的公共准备：清打断标志、（满了就）压缩、补上一轮遗留的打断标记。run_turn / run_bg_turn 共用。"""
         # 每轮开头清掉上一轮残留的打断标志。
@@ -281,31 +333,8 @@ class Agent:
         # 收益微小、风险不小，故【有意不修】。真要修的方向：只有自己 new 了这个 Event 的 agent 才清
         # （主 agent 清=用户发了新消息，语义正确；从属 agent 不清=无权代表用户撤销）。
         self._interrupt.clear()
-        # 加固④：上下文压缩 —— 在追加本轮内容【之前】压一次。优先用上次请求返回的精确 prompt_tokens
-        # 判断（token 只有请求后才知道，故用上次的值）；为 0 时（后端不回 usage / 刚压缩完）用本地
-        # 字符粗估兜底——否则不回 usage 的后端永不触发压缩，一路涨到撑爆窗口。
-        # 旧历史交给摘要承载，本轮新内容随后原样追加。
-        tokens = self.context_tokens or estimate_tokens(self.messages, self.tools.schemas())
-        if tokens > self.config.compact_threshold * self.config.context_limit:
-            compacted = compact(
-                self._summarize, self.messages,
-                read_tools=tuple(
-                    t.strip() for t in self.config.rescue_read_tools.split(",") if t.strip()
-                ),
-                rescue_count=self.config.rescue_read_count,
-                transcript_pointer=(self.store.transcript_path.as_posix()
-                                    if self.store is not None else None),
-                on_compacted=self._on_compacted,
-            )
-            if compacted is not None:
-                self.messages = compacted
-                yield Notice(f"上下文 {'' if self.context_tokens else '约'}{tokens} tokens 接近上限，已压缩旧历史")
-                self.context_tokens = 0   # 压缩后重置，等下次请求测得新值
-                # 任务清单是带外状态（存 tasks.json、不在被压的历史里）。压缩可能把 task_* 调用折叠掉，
-                # 这里把当前清单快照重新注入一条，确保模型压缩后仍看得见自己的清单（侧栏始终在、不受影响）。
-                snap = self._tasks.render_reminder()
-                if snap:
-                    self._record({"role": "user", "content": _reminder(snap)})
+        # 加固④：上下文压缩 —— 在追加本轮内容【之前】压一次。旧历史交给摘要承载，本轮新内容随后原样追加。
+        yield from self._maybe_compact()
         # 上一轮的打断若没在上下文留下标记（流式被打断、或工具批已全完成后才被打断）→ 单独插一条
         # [Request interrupted by user]，让模型知道上一步被打断；工具执行中途被打断时，补齐的 tool
         # 结果里已带该标记，就不再重复插。
@@ -322,6 +351,25 @@ class Agent:
         不进 system prompt（前缀稳→不击穿缓存）。normal/auto 的 mode_reminder 为空 → 不注。切模式即时生效（下一轮）。"""
         if self.mode_reminder:
             self._record({"role": "user", "content": _reminder(self.mode_reminder)})
+
+    @staticmethod
+    def _edits_project(tool_calls: list[ToolCall]) -> bool:
+        """这批工具调用里有没有改到【工作目录内】的文件。
+        限定在工作目录内：临时脚本常写在 /tmp、系统临时目录这类外面，那些不算"在推进任务"。"""
+        root = Path.cwd().resolve()
+        for tc in tool_calls:
+            if tc.name not in ("edit_file", "write_file"):
+                continue
+            args = tc.arguments if isinstance(tc.arguments, dict) else {}
+            p = args.get("path")
+            if not p:
+                continue
+            try:
+                if Path(str(p)).resolve().is_relative_to(root):
+                    return True
+            except (OSError, ValueError):   # 畸形路径/跨盘符：当作不在项目内
+                continue
+        return False
 
     def _run_loop_guarded(self) -> Iterator[Event]:
         """跑 _turn_loop，包在 try 里支持 Ctrl-C/打断：不回滚——已完成的工具调用+结果是有用上下文，
@@ -452,6 +500,7 @@ class Agent:
         iterations = 0            # 防跑飞：循环计数
         empty_retries = 0         # 空响应重试计数
         executed_tools = False    # 本轮是否执行过工具（决定空响应时的提示策略）
+        no_edit = 0               # 连续多少次迭代没改到工作目录内的文件（喂 _NO_EDIT_REMINDER）
         self._plan_pending = False   # 本轮复位：exit_plan 会置 True → 执行完工具即结束本轮
 
         while True:
@@ -469,7 +518,22 @@ class Agent:
                     f"等用户指示。")})
                 return
 
+            # 加固⑤：轮【内】压缩 —— 单轮里几十次工具调用照样能把上下文顶满，而 _pre_turn 只在轮
+            # 开头查一次（一条 issue 跑到底的无头任务整轮只查得到那一次，等于全程不压）。
+            # 这里是干净边界：上一批工具结果都已 _record、没有在飞的流、没有孤儿 tool_call，
+            # 所以直接压即可，不必先制造一次打断再收拾它。
+            # iterations > 1：第 1 次迭代 _pre_turn 刚查过，不重复。
+            if iterations > 1:
+                yield from self._maybe_compact(_COMPACT_RESUME)
+
             self._inject_bg_events()        # 每次调模型【前】清后台事件：完成 + 到点的 check-in
+
+            # 长时间只读不改 → 注一条提示（实测：难题上模型会在临时目录反复造探测脚本、
+            # 上百轮不碰源码）。注完清零：再攒够 N 次才会重注，不刷屏。
+            if self.config.no_edit_reminder_turns and no_edit >= self.config.no_edit_reminder_turns:
+                self._record({"role": "user",
+                              "content": _reminder(_NO_EDIT_REMINDER.format(n=no_edit))})
+                no_edit = 0
 
             text = ""                       # 本次模型输出的可见正文
             reasoning = ""                  # 本次模型的思考正文（统一 reasoning_content 载体，无条件落盘）
@@ -542,6 +606,7 @@ class Agent:
             #    等齐所有结果；wall-clock=最慢那个、不是求和——顺序阻塞就退化成 leader 自己干）；
             #    连续的只读工具组（read_only=True，见下方分组循环）。其余工具顺序跑。
             executed_tools = True
+            no_edit = 0 if self._edits_project(tool_calls) else no_edit + 1
             # 前台 subagent（无 background）→ 并发批；后台 subagent（background:true）归 others → _exec_tool 拿 bg
             # 起（start_subagent，立即返回 id、不阻塞），和 bash background 一个套路。
             def _fg_sub(tc):

@@ -459,3 +459,98 @@ def test_只出了思考就断_不补空消息():
         {"role": "assistant", "content": "上一轮的完整结论"}]        # 没多出空消息
     from mecode.compact import _last_content
     assert _last_content(a.messages, "assistant") == "上一轮的完整结论"   # 保留位没被顶掉
+
+
+# ---- 轮【内】压缩（_turn_loop 顶部；_pre_turn 只管轮开头） ----
+
+class _RampToolProvider:
+    """每次调用都调一次工具，prompt_tokens 逐轮递增 —— 模拟单轮内上下文一路顶满。
+    n_tools 次之后收尾，防止测试无限循环。"""
+    def __init__(self, n_tools=4, step=100):
+        self.calls = 0
+        self.n_tools = n_tools
+        self.step = step
+        self.seen_msgs = []            # 每次请求时的消息条数（压缩会让它缩水）
+
+    def stream(self, messages, tools=None, should_stop=None):
+        self.calls += 1
+        self.seen_msgs.append(len(messages))
+        if self.calls <= self.n_tools:
+            yield ToolCall(id=f"c{self.calls}", name="noop", arguments={})
+            yield Usage(prompt_tokens=self.step * self.calls, completion_tokens=1,
+                        total_tokens=self.step * self.calls + 1)
+            yield Done(reason="tool_calls")
+        else:
+            yield TextDelta("完成")
+            yield Usage(prompt_tokens=10, completion_tokens=1, total_tokens=11)
+            yield Done(reason="stop")
+
+
+def _ramp_agent(provider, **cfg_over):
+    cfg = replace(agent_config, **cfg_over)
+    return Agent(provider, _noop_reg(), system_prompt="你是助手", config=cfg)
+
+
+def test_轮内超阈值会压缩_不再等到下一轮开头(tmp_path):
+    p = _RampToolProvider(n_tools=4, step=100)
+    a = _ramp_agent(p, context_limit=250, compact_threshold=0.8)   # 阈值 200 → 第 3 次请求后越线
+    list(a.run_turn("干活"))
+    assert p.calls > 2, "provider 没被调够次数，测试前提不成立"
+    # 压缩后 messages 会缩水：某次请求看到的条数比上一次少
+    assert any(b < x for x, b in zip(p.seen_msgs, p.seen_msgs[1:])), \
+        f"消息数全程单调不减={p.seen_msgs} —— 轮内压缩没发生"
+
+
+def test_轮内压缩会注入续跑说明_且点明不是用户打断(tmp_path):
+    p = _RampToolProvider(n_tools=4, step=100)
+    a = _ramp_agent(p, context_limit=250, compact_threshold=0.8)
+    list(a.run_turn("干活"))
+    hints = [m["content"] for m in a.messages
+             if m["role"] == "user" and "不是用户打断" in m.get("content", "")]
+    assert hints, "轮内压缩后没注入续跑说明 —— 模型会以为被用户叫停"
+    assert "<system-reminder>" in hints[0]           # 带外注入，不显示成用户消息
+
+
+def test_轮开头压缩不注入续跑说明(tmp_path):
+    """轮开头压缩后紧跟着就是用户的新消息，不需要（也不该）说"接着做原来的任务"。"""
+    a = _agent(tmp_path, context_limit=10, compact_threshold=0.5)
+    a.messages += [{"role": "user", "content": "老问题"},
+                   {"role": "assistant", "content": "老回答"}]
+    a.context_tokens = 9999
+    list(a.run_turn("新问题"))
+    assert all("不是用户打断" not in m.get("content", "") for m in a.messages)
+
+
+def test_轮内压缩后_tool_call与tool结果仍然配对(tmp_path):
+    """压缩在工具循环中途整体替换 messages —— 最大的风险是把 tool_call 和它的结果拆散，
+    留下孤儿 tool_call（后端直接 400）。"""
+    p = _RampToolProvider(n_tools=4, step=100)
+    a = _ramp_agent(p, context_limit=250, compact_threshold=0.8)
+    list(a.run_turn("干活"))
+    pending = []
+    for m in a.messages:
+        if m["role"] == "assistant":
+            pending = [tc["id"] for tc in (m.get("tool_calls") or [])]
+        elif m["role"] == "tool":
+            if m.get("tool_call_id") in pending:
+                pending.remove(m["tool_call_id"])
+    assert not pending, f"存在没有结果的孤儿 tool_call：{pending}"
+
+
+def test_未超阈值时轮内不压缩(tmp_path):
+    p = _RampToolProvider(n_tools=3, step=10)
+    a = _ramp_agent(p, context_limit=100_000, compact_threshold=0.8)
+    list(a.run_turn("干活"))
+    assert p.seen_msgs == sorted(p.seen_msgs), f"没超阈值却缩水了：{p.seen_msgs}"
+    assert all("不是用户打断" not in m.get("content", "") for m in a.messages)
+
+
+def test_压缩后重新注入任务清单快照(tmp_path):
+    """任务清单是带外状态（存 tasks.json，不在被压的历史里）：压缩会把 task_* 调用折叠进摘要，
+    不重新注入一份，模型压缩后就看不见自己的清单了。轮开头/轮内两条路径共用同一段代码。"""
+    p = _RampToolProvider(n_tools=4, step=100)
+    a = _ramp_agent(p, context_limit=250, compact_threshold=0.8)
+    a._tasks.render_reminder = lambda: "当前清单：[ ] 把活干完"       # 装一份非空清单
+    list(a.run_turn("干活"))
+    assert any("把活干完" in m.get("content", "") for m in a.messages), \
+        "压缩后没把任务清单重新注入 —— 模型会丢掉自己的待办"

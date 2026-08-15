@@ -154,7 +154,12 @@ def subagent_tools(runner: SubagentRunner) -> list[Tool]:
                     "它跑不动或失败也会在总结里说明。它自己【不能】再派子 agent。\n"
                     "【前台（默认）vs 后台】：要它的结果才能往下走（调研/多角度/验证）→ 用前台，"
                     "同一条消息里发【多个】subagent 调用会【并发】跑、等齐所有结果（三个各 30s 的，30s 跑完不是 90s）；"
-                    "真正独立、不用马上要 → 设 background=true 转后台，立即返回编号、完成再通知你（可 kill_bgtask 停）。",
+                    "真正独立、不用马上要 → 设 background=true 转后台，立即返回编号、完成再通知你（可 kill_bgtask 停）。\n"
+                    "【什么时候【不】该派】：目标已经明确就直接自己做——知道路径就 read_file、"
+                    "找某个符号就 grep；一两步能做完的事别派子 agent，那比自己做还慢。\n"
+                    "子 agent 改过代码的，你要自己核一遍实际改动再向用户汇报，别只转述它的总结。\n"
+                    "别把【理解】外包：不要写“根据你的发现把这个 bug 修好”这类指令——"
+                    "那是把判断推给了子 agent，该你自己做的分析要自己做。",
         parameters={
             "type": "object",
             "properties": {

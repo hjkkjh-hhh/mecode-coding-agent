@@ -196,7 +196,10 @@ class AgentConfig:
     tool_result_max_chars: int = int(os.getenv("MECODE_TOOL_RESULT_MAX_CHARS", "6000"))  # 单个工具结果入场上限（头+尾共留这么多字）约1000token
     tool_result_keep_tail: int = int(os.getenv("MECODE_TOOL_RESULT_KEEP_TAIL", "1200"))   # 末尾保底留多少（给报错/结尾状态）
     rescue_read_tools: str = os.getenv("MECODE_RESCUE_READ_TOOLS", "read_file")          # 压缩后保留原文的"read类"工具名（逗号分隔）
-    rescue_read_count: int = int(os.getenv("MECODE_RESCUE_READ_COUNT", "5"))             # 压缩后保留最近几个 read 的文件原文
+    rescue_read_count: int = int(os.getenv("MECODE_RESCUE_READ_COUNT", "0"))             # 压缩后保留最近几次 read 的原文（0=不限条数，全由 rescue_read_max_tokens 封顶）
+    rescue_read_max_files: int = int(os.getenv("MECODE_RESCUE_READ_MAX_FILES", "5"))     # 救援最多涉及几个不同文件（0=不限）；这几个文件的【全部】区间都留，总量再由 max_tokens 封顶
+    rescue_read_max_tokens: int = int(os.getenv("MECODE_RESCUE_READ_MAX_TOKENS", "5000"))  # 救援原文总量上限（0=不限）。默认 5000≈原先"6000字截断×5条"的实际量，零回归；显式封顶，免得改了截断值就失控
+    no_edit_reminder_turns: int = int(os.getenv("MECODE_NO_EDIT_REMINDER_TURNS", "25"))   # 连续几次迭代没改工作目录下的文件就注一条提示（0=关）
     session_root: str = os.getenv("MECODE_SESSION_ROOT", "~/.mecode")                     # 会话存储根：~/.mecode/projects/<slug>/sessions/<uuid>/
 
 

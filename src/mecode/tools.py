@@ -274,7 +274,10 @@ def _expand_braces(pattern: str) -> list[str]:
 def _read_file(args: dict) -> str:
     # 行窗口读：默认从 offset 行起返回 limit 行，每行带 cat -n 行号前缀（行号仅显示用，
     # 不属于文件真实内容）。大文件不一次性灌进上下文，模型用 offset/limit 翻页。
-    path = Path(args["path"])
+    # resolve()：把相对路径/符号链接归一成同一个绝对路径。回显路径要稳定——模型靠它认出
+    # "这个文件我读过"，同一文件出现 /a/b/x.py 和 b/x.py 两种写法时它分不清（实测撞到过）。
+    # 安全无关：权限闸在 handler 之前已按真实落点判过。
+    path = Path(args["path"]).resolve()
     if not path.is_file():
         return f"错误：文件不存在 {path}"
     size = path.stat().st_size
@@ -291,7 +294,9 @@ def _read_file(args: dict) -> str:
         return f"# {path}（共 {total} 行）\n（此范围无内容）"
     header = f"# {path}（共 {total} 行，显示第 {start + 1}-{end} 行）"
     if end < total:
-        header += f"；还有更多，用 offset={end} 继续读"
+        # 只陈述状态，不指示下一步动作。原文案"还有更多，用 offset=N 继续读"是翻页指令，
+        # 实测大文件上模型会一页页翻、边界只挪几行地反复读同一段。
+        header += f"；文件还有 {total - end} 行未显示"
     body = "\n".join(f"{start + i + 1:>6}\t{line}" for i, line in enumerate(lines[start:end]))
     return f"{header}\n{body}"
 
@@ -561,6 +566,27 @@ def _bash(args: dict, slot: "ProcSlot | None" = None,
     return "\n".join(parts) if parts else "（命令执行成功，无输出）"
 
 
+def _render_hits(path: str, lines: list[str], hits: list[tuple[int, str]],
+                 before: int, after: int) -> list[str]:
+    """content 模式的输出行。按 ripgrep 惯例：匹配行 `路径:行号:`、上下文行 `路径-行号-`，
+    不相邻的块之间插 `--`。重叠的块合并，同一行不会输出两次。"""
+    if not before and not after:
+        return [f"{path}:{i}: {ln.rstrip()}" for i, ln in hits]
+    hit_lines = {i for i, _ in hits}
+    out: list[str] = []
+    prev_end = 0
+    for i, _ in hits:
+        start, end = max(1, i - before), min(len(lines), i + after)
+        if prev_end and start > prev_end + 1:
+            out.append("--")
+        start = max(start, prev_end + 1)          # 与上一块重叠 → 只补没输出过的部分
+        for k in range(start, end + 1):
+            sep = ":" if k in hit_lines else "-"
+            out.append(f"{path}{sep}{k}{sep} {lines[k - 1].rstrip()}")
+        prev_end = max(prev_end, end)
+    return out
+
+
 def _grep(args: dict) -> str:
     # 内容正则搜索：递归走文件、跳二进制和噪音目录，按 output_mode 给结果。
     pattern = args.get("pattern", "")
@@ -575,9 +601,14 @@ def _grep(args: dict) -> str:
         return f"错误：路径不存在 {base}"
     mode = args.get("output_mode", "files_with_matches")
     limit = int(args.get("head_limit", GREP_MAX_RESULTS))
+    # 上下文行数（同 ripgrep 的 -C/-B/-A）：context 同时设前后，before/after 单独给时覆盖它。
+    ctx = max(0, int(args.get("context") or 0))
+    before = max(0, int(args["before"])) if args.get("before") is not None else ctx
+    after = max(0, int(args["after"])) if args.get("after") is not None else ctx
     files = [base] if base.is_file() else _iter_files(base, args.get("glob"))
 
     results: list[str] = []
+    n = 0                       # content 模式计【匹配数】，其余模式计文件数
     truncated = False
     for f in files:
         try:
@@ -586,26 +617,33 @@ def _grep(args: dict) -> str:
             continue
         if _is_binary(raw):
             continue
-        hits = [(i, ln) for i, ln in enumerate(raw.decode("utf-8", errors="replace").splitlines(), 1)
-                if regex.search(ln)]
+        lines = raw.decode("utf-8", errors="replace").splitlines()
+        hits = [(i, ln) for i, ln in enumerate(lines, 1) if regex.search(ln)]
         if not hits:
             continue
+        # 路径统一正斜杠：系统提示词和 read_file 都用 /，这里回反斜杠的话同一文件在上下文里
+        # 出现两种写法，模型判断"这个我读过没有"会受影响。
+        path = f.as_posix()
         if mode == "content":
-            results += [f"{f}:{i}: {ln.rstrip()}" for i, ln in hits]
+            take = hits[:max(0, limit - n)]
+            truncated = truncated or len(take) < len(hits)
+            results += _render_hits(path, lines, take, before, after)
+            n += len(take)
         elif mode == "count":
-            results.append(f"{f}: {len(hits)} 处")
+            results.append(f"{path}: {len(hits)} 处")
+            n += 1
         else:                       # files_with_matches
-            results.append(str(f))
-        if len(results) >= limit:
+            results.append(path)
+            n += 1
+        if n >= limit:
             truncated = True
-            results = results[:limit]
             break
 
     if not results:
         return f"没有匹配 /{pattern}/ 的内容（在 {base} 下）"
     label = {"content": "行匹配", "count": "个文件"}.get(mode, "个文件含匹配")
     suffix = "（已截断，缩小范围或加 glob 过滤）" if truncated else ""
-    return f"匹配 /{pattern}/：{len(results)} {label}{suffix}\n" + "\n".join(results)
+    return f"匹配 /{pattern}/：{n} {label}{suffix}\n" + "\n".join(results)
 
 
 def _glob(args: dict) -> str:
@@ -652,7 +690,11 @@ def default_registry() -> ToolRegistry:
     reg = ToolRegistry()
     reg.register(Tool(
         name="read_file",
-        description="读取本地文本文件。默认从第 offset 行起返回 limit（默认 200）行，每行带行号前缀；文件更长时会提示用 offset 继续读。二进制文件和超 10MB 的文件会被拒绝。",
+        description=(
+            "读取本地文本文件。默认从第 offset 行起返回 limit（默认 200）行，每行带行号前缀；"
+            "文件更长时会提示用 offset 继续读。二进制文件和超 10MB 的文件会被拒绝。\n"
+            "- 知道要看哪段就只读哪段，别整个文件翻；不确定就先 grep 定位。\n"
+            "- 刚用 edit_file 改过的文件不必再读一遍确认：改失败 edit_file 会直接报错，成功就是成功。"),
         parameters={
             "type": "object",
             "properties": {
@@ -668,7 +710,10 @@ def default_registry() -> ToolRegistry:
     ))
     reg.register(Tool(
         name="write_file",
-        description="把内容写入文件（整文件覆盖；文件不存在则创建，自动建父目录）。新建文件或整体重写时用它；只改局部请用 edit_file。",
+        description=(
+            "把内容写入文件（整文件覆盖；文件不存在则创建，自动建父目录）。"
+            "新建文件或整体重写时用它；只改局部请用 edit_file。\n"
+            "- 除非用户明确要求，不要创建 *.md / README 这类文档文件。"),
         parameters={
             "type": "object",
             "properties": {
@@ -681,7 +726,13 @@ def default_registry() -> ToolRegistry:
     ))
     reg.register(Tool(
         name="edit_file",
-        description="在已存在的文件里把 old_string 替换成 new_string。old_string 必须与原文完全一致（含缩进/换行）且在文件中唯一，否则报错；要替换多处可设 replace_all=true。新建或整体重写请用 write_file。",
+        description=(
+            "在已存在的文件里把 old_string 替换成 new_string。old_string 必须与原文完全一致"
+            "（含缩进/换行）且在文件中唯一，否则报错；要替换多处可设 replace_all=true。"
+            "新建或整体重写请用 write_file。\n"
+            "- 报「不唯一」时：把 old_string 往前后扩到包含足够上下文使其唯一，"
+            "或确实要全改就用 replace_all=true。\n"
+            "- 改完跑一次相关测试确认（bash），别只凭读代码判断改对了。"),
         parameters={
             "type": "object",
             "properties": {
@@ -716,7 +767,12 @@ def default_registry() -> ToolRegistry:
     ))
     reg.register(Tool(
         name="grep",
-        description="按正则在文件内容里搜索（递归，自动跳过 .git/.mecode/node_modules 等噪音目录和二进制文件；path 显式指进这些目录时照常搜）。output_mode：files_with_matches（默认，列出含匹配的文件）/ content（带行号的匹配行）/ count（每个文件的匹配数）。可用 glob 过滤文件名、case_insensitive 忽略大小写、head_limit 限制条数。",
+        description=("按正则在文件内容里搜索（递归，自动跳过 .git/.mecode/node_modules 等噪音目录和二进制文件；"
+                     "path 显式指进这些目录时照常搜）。output_mode：files_with_matches（默认，列出含匹配的文件）"
+                     "/ content（带行号的匹配行）/ count（每个文件的匹配数）。"
+                     "可用 glob 过滤文件名、case_insensitive 忽略大小写、head_limit 限制条数。\n"
+                     "- 要看匹配处的代码就配 context（同 ripgrep 的 -C，前后各 N 行），一次拿到函数体，"
+                     "不必再 read_file 去猜区间。只关心某一侧用 before / after。"),
         parameters={
             "type": "object",
             "properties": {
@@ -726,6 +782,9 @@ def default_registry() -> ToolRegistry:
                 "glob": {"type": "string", "description": "文件名过滤，如 *.py"},
                 "case_insensitive": {"type": "boolean", "description": "忽略大小写"},
                 "head_limit": {"type": "integer", "description": "最多返回多少条（默认 200）"},
+                "context": {"type": "integer", "description": "每个匹配前后各带几行上下文（同 ripgrep -C），只在 output_mode=content 下生效"},
+                "before": {"type": "integer", "description": "匹配前带几行（同 -B），给了就覆盖 context"},
+                "after": {"type": "integer", "description": "匹配后带几行（同 -A），给了就覆盖 context"},
             },
             "required": ["pattern"],
         },

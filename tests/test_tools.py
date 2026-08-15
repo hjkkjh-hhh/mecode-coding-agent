@@ -7,7 +7,7 @@ import shutil
 
 import pytest
 
-from mecode.tools import MAX_WRITE_BYTES, _bash_command, default_registry
+from mecode.tools import MAX_WRITE_BYTES, _bash_command, _read_file, default_registry
 
 
 def _exec(name, **args):
@@ -24,13 +24,23 @@ def test_read_带行号与总行数(tmp_path):
     assert "     1\taaa" in out and "     3\tccc" in out      # cat -n 行号前缀
 
 
-def test_read_limit窗口_并提示翻页(tmp_path):
+def test_read_limit窗口_截断时报剩余行数而非指示翻页(tmp_path):
+    """截断提示只陈述状态、不给下一步动作：原来那句"用 offset=N 继续读"是翻页指令，
+    实测会让模型在大文件上一页页翻、边界只挪几行地反复读同一段。"""
     p = tmp_path / "a.txt"
     p.write_text("\n".join(f"L{i}" for i in range(10)), encoding="utf-8")
     out = _exec("read_file", path=str(p), limit=3)
     assert "显示第 1-3 行" in out
-    assert "offset=3" in out                                  # 翻页提示
+    assert "还有 7 行未显示" in out
+    assert "offset=" not in out                               # 不再推翻页指令
     assert "L0" in out and "L3" not in out                    # 只给了前 3 行
+
+
+def test_read_读到末尾不加截断提示(tmp_path):
+    p = tmp_path / "a.txt"
+    p.write_text("L0\nL1\nL2", encoding="utf-8")
+    out = _exec("read_file", path=str(p), limit=100)
+    assert "未显示" not in out
 
 
 def test_read_offset(tmp_path):
@@ -376,3 +386,80 @@ def test_glob_按修改时间倒序(tmp_path):
     os.utime(old, (1, 1))                                    # 把 old 的时间设得很旧
     out = _exec("glob", pattern="*.py", path=str(tmp_path))
     assert out.index("new.py") < out.index("old.py")         # 新的在前
+
+
+def test_read_file_回显路径归一化(tmp_path, monkeypatch):
+    """同一文件不论用绝对还是相对路径读，回显的路径要一致——模型靠它认出「这个我读过」。"""
+    f = tmp_path / "sub" / "q.py"
+    f.parent.mkdir(parents=True)
+    f.write_text("line1\nline2\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    abs_head = _read_file({"path": f.as_posix()}).splitlines()[0]
+    rel_head = _read_file({"path": "sub/q.py"}).splitlines()[0]
+    assert abs_head == rel_head, f"两种写法回显不一致：\n{abs_head}\n{rel_head}"
+
+
+# ---- grep 上下文（-C/-B/-A）：消掉「grep 定位完再 read_file 猜区间」的往返 ----
+
+def _ctxfile(tmp_path, n=20):
+    p = tmp_path / "m.py"
+    p.write_text("\n".join(f"L{i}" for i in range(1, n + 1)), encoding="utf-8")
+    return p
+
+
+def test_grep_context前后各N行(tmp_path):
+    _ctxfile(tmp_path)
+    out = _exec("grep", pattern="^L10$", path=str(tmp_path), output_mode="content", context=2)
+    for k in (8, 9, 11, 12):
+        assert f"-{k}- L{k}" in out                      # 上下文行用 `-`
+    assert ":10: L10" in out                             # 匹配行用 `:`
+    assert "L7" not in out and "L13" not in out          # 范围之外不带
+
+
+def test_grep_before与after可单独给并覆盖context(tmp_path):
+    _ctxfile(tmp_path)
+    out = _exec("grep", pattern="^L10$", path=str(tmp_path), output_mode="content",
+                context=5, before=1, after=0)
+    assert "-9- L9" in out and ":10: L10" in out
+    assert "L11" not in out and "L8" not in out
+
+
+def test_grep_重叠块合并_同一行不输出两次(tmp_path):
+    _ctxfile(tmp_path)
+    out = _exec("grep", pattern="^L1[01]$", path=str(tmp_path), output_mode="content", context=3)
+    assert out.count(" L10") == 1 and out.count(" L11") == 1    # 两个匹配的窗口重叠
+    assert "--" not in out                                       # 连成一块，不该有分隔
+
+
+def test_grep_不相邻的块之间插分隔(tmp_path):
+    _ctxfile(tmp_path)
+    out = _exec("grep", pattern="^L(2|18)$", path=str(tmp_path), output_mode="content", context=1)
+    assert "--" in out
+
+
+def test_grep_context不越界(tmp_path):
+    _ctxfile(tmp_path, n=3)
+    out = _exec("grep", pattern="^L1$", path=str(tmp_path), output_mode="content", context=5)
+    assert ":1: L1" in out and "-3- L3" in out            # 头尾都被文件边界夹住，不报错
+
+
+def test_grep_不给context时格式不变(tmp_path):
+    _ctxfile(tmp_path)
+    out = _exec("grep", pattern="^L10$", path=str(tmp_path), output_mode="content")
+    assert ":10: L10" in out
+    assert "-9-" not in out and "--" not in out
+
+
+def test_grep_head_limit在content模式按匹配数算(tmp_path):
+    _ctxfile(tmp_path)
+    out = _exec("grep", pattern="^L", path=str(tmp_path), output_mode="content",
+                context=1, head_limit=2)
+    assert out.startswith("匹配 /^L/：2 行匹配（已截断")   # 2 个匹配，不是 2 行输出
+
+
+def test_grep_路径用正斜杠(tmp_path):
+    """与 read_file / 系统提示词统一：同一文件两种写法会干扰模型判断"这个我读过没有"。"""
+    _ctxfile(tmp_path)
+    for kw in ({}, {"output_mode": "content"}, {"output_mode": "count"}):
+        out = _exec("grep", pattern="^L1$", path=str(tmp_path), **kw)
+        assert "\\" not in out, out
