@@ -32,6 +32,12 @@ class ThinkingProfile:
         ""           不带（未注册/老后端；也避免往不认识的服务端塞未知字段被拒）
         "all"        每一轮 assistant 都带（Kimi keep=all / MiniMax）
         "tool_calls" 只有【带工具调用】的 assistant 带，纯答案回合不带（DeepSeek/GLM）
+    - max_output：单次响应的 token 上限（发 `max_tokens`）。0=不发。
+        防的是【生成退化】：跑批实测 7233 次响应里中位数只有 286 token、p99.9 是 36499，
+        却有 2 次顶满 131072（模型 128K 输出上限）——模型试图回忆某个编号列表，
+        卡进等差数列一路数下去，一轮就吃掉大半个上下文、逼出一次压缩。
+        不设成全局默认是因为它【不能超过模型自己的上限】：本地 vLLM / 小上下文部署
+        （如 8192）收到 32000 会直接 400。所以按档案走，未命中就不发（零回归）。
     """
     supports_thinking: bool = False
     toggleable: bool = False
@@ -41,18 +47,28 @@ class ThinkingProfile:
     default_effort: str = ""
     reasoning_split: bool = False
     keep_reasoning: str = ""
+    max_output: int = 0
+
+
+# 单次响应上限的默认值：给已知支持长输出的云端模型用。
+# 32000 的来历：实测响应中位数 286 token，这个值是它的 110 倍，正常轮次碰不到
+# （7233 次里只有 0.25% 超过），同时把单轮的破坏面压在 1/3 个上下文以内。
+# 放宽到 48000 只能少截 0.2%，却让一轮能吃掉近一半上下文，不划算。
+MAX_OUTPUT_DEFAULT = 32000
 
 
 # Kimi k2.7-code / -highspeed：思考【强制开】(toggleable=False，不显开关)+ keep 恒 all + 每轮回传 reasoning。
-KIMI_FORCED = ThinkingProfile(supports_thinking=True, toggleable=False, keep="all", keep_reasoning="all")
+KIMI_FORCED = ThinkingProfile(supports_thinking=True, toggleable=False, keep="all", keep_reasoning="all",
+                              max_output=MAX_OUTPUT_DEFAULT)
 
 # Kimi k2.6：思考【可开关】(toggleable=True，弹窗显"思考 开/关")；keep 仍恒 all（只 type 可改、keep 不做成开关）。
-KIMI_K26 = ThinkingProfile(supports_thinking=True, toggleable=True, keep="all", keep_reasoning="all")
+KIMI_K26 = ThinkingProfile(supports_thinking=True, toggleable=True, keep="all", keep_reasoning="all",
+                           max_output=MAX_OUTPUT_DEFAULT)
 
 # DeepSeek(v4-flash/pro)：思考可开关 + 深度 high/max（默认 max）+ 只保留工具调用回合的思考。
 DEEPSEEK = ThinkingProfile(supports_thinking=True, toggleable=True,
                            effort_tiers=("high", "max"), default_effort="max",
-                           keep_reasoning="tool_calls")
+                           keep_reasoning="tool_calls", max_output=MAX_OUTPUT_DEFAULT)
 
 # GLM(智谱)：type 可开关(所有 GLM-5.x)；无 keep(那是 Kimi 专属)。
 # 多轮：带工具调用的 assistant 必须回传 reasoning_content、纯答案回合不带 → keep_reasoning="tool_calls"(同 DeepSeek)。
@@ -60,17 +76,20 @@ DEEPSEEK = ThinkingProfile(supports_thinking=True, toggleable=True,
 #   none=放弃思考=思考关，由 type=disabled 覆盖，不单列）。
 GLM_52 = ThinkingProfile(supports_thinking=True, toggleable=True,
                          effort_tiers=("high", "max"), default_effort="max",
-                         keep_reasoning="tool_calls")
+                         keep_reasoning="tool_calls", max_output=MAX_OUTPUT_DEFAULT)
 # GLM-5.2 以下(5.1/5/turbo)：type 可开关，但无深度档。
-GLM_PLAIN = ThinkingProfile(supports_thinking=True, toggleable=True, keep_reasoning="tool_calls")
+GLM_PLAIN = ThinkingProfile(supports_thinking=True, toggleable=True, keep_reasoning="tool_calls",
+                            max_output=MAX_OUTPUT_DEFAULT)
 
 # MiniMax：思考"开"值是 adaptive（非 enabled）；发 reasoning_split=True 让思考出独立字段（它会双发
 # reasoning_content + reasoning_details 两份相同内容，统一只认前者）；工具+纯文本回合都要回传 →
 # keep_reasoning="all"；无深度档(reasoning_effort 被忽略)。M3 可开关；M2.7 / -highspeed 强制开（传 disabled 无效）。
 MINIMAX_M3 = ThinkingProfile(supports_thinking=True, toggleable=True, on_value="adaptive",
-                             reasoning_split=True, keep_reasoning="all")
+                             reasoning_split=True, keep_reasoning="all",
+                             max_output=MAX_OUTPUT_DEFAULT)
 MINIMAX_FORCED = ThinkingProfile(supports_thinking=True, toggleable=False, on_value="adaptive",
-                                 reasoning_split=True, keep_reasoning="all")
+                                 reasoning_split=True, keep_reasoning="all",
+                                 max_output=MAX_OUTPUT_DEFAULT)
 
 # 默认档（未注册/自填未命中的模型，如本地 vLLM、Qwen）：
 # 【不发 thinking 参数】——各家形态互不相通（enabled/adaptive/reasoning_effort/reasoning_split），

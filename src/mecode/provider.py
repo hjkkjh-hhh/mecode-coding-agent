@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Callable, Iterator
 
@@ -90,6 +91,10 @@ class Provider:
         # 思考运行态（TUI 弹窗切、随会话持久化）：thinking_on=开关，effort=深度档；默认开 + 档案默认档。
         self.thinking_on = True
         self.effort = self.profile.default_effort
+        # 单次响应封顶：档案给默认，MECODE_MAX_OUTPUT_TOKENS 可覆盖（0=不发）。
+        # 未命中档案的后端（本地 vLLM / 小上下文部署）默认为 0——发一个超过它自身上限的
+        # max_tokens 就是 400，不发才是安全默认。要给这类后端加保护就显式设环境变量。
+        self.max_output = int(os.getenv("MECODE_MAX_OUTPUT_TOKENS", "") or self.profile.max_output)
         self._url = f"{backend.base_url}/chat/completions"
         self._headers = {"Authorization": f"Bearer {backend.api_key}"}
         self.max_retries = max_retries        # 瞬时错误最多重试几次
@@ -152,6 +157,8 @@ class Provider:
         if tools:
             payload["tools"] = tools
         payload.update(self._thinking_fields())      # 命中档案才加 thinking / reasoning_effort
+        if self.max_output:                          # 命中档案才封顶单次响应（见 ThinkingProfile.max_output）
+            payload["max_tokens"] = self.max_output
 
         for attempt in range(self.max_retries + 1):
             streaming = False                  # 是否已开始消费流（标记后不再重试）

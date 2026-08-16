@@ -10,6 +10,7 @@ import pytest
 from mecode.config import Backend
 from mecode.events import Done, ReasoningDelta, TextDelta
 from mecode.provider import Provider, ProviderError, _backoff, _is_retriable_status
+from mecode.registry import MAX_OUTPUT_DEFAULT
 
 # 一段最小可用的 SSE：一片正文 + 末尾 usage + [DONE]
 _SSE_OK = (b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
@@ -275,3 +276,29 @@ def test_should_stop_提前停止():
     evs = list(p.stream([{"role": "user", "content": "hi"}], should_stop=stop))
     assert any(isinstance(e, TextDelta) for e in evs)   # 收到了开头的正文
     assert not any(isinstance(e, Done) for e in evs)    # 提前停 → 没有 Done
+
+
+# ---- 单次响应封顶 max_tokens（防生成退化，见 registry.ThinkingProfile.max_output）----
+
+def test_命中档案的模型_payload带max_tokens():
+    """跑批实测：7233 次响应中位数 286 token，却有 2 次顶满 131072（模型试图回忆一串编号，
+    卡进等差数列一路数下去），一轮吃掉大半个上下文。封顶就是防这个。"""
+    for model in ("deepseek-v4-flash", "kimi-k2.7-code", "glm-5.2", "MiniMax-M3"):
+        assert _payload_for(model)["max_tokens"] == MAX_OUTPUT_DEFAULT, model
+
+
+def test_未命中档案的模型_不发max_tokens():
+    """本地 vLLM / 小上下文部署（如 8192）收到一个超过自身上限的 max_tokens 就是 400。
+    和 thinking 参数同一个道理：不发才是安全默认。"""
+    assert "max_tokens" not in _payload_for("some-local-qwen")
+
+
+def test_环境变量可覆盖(monkeypatch):
+    monkeypatch.setenv("MECODE_MAX_OUTPUT_TOKENS", "4096")
+    assert _payload_for("deepseek-v4-flash")["max_tokens"] == 4096
+    assert _payload_for("some-local-qwen")["max_tokens"] == 4096      # 给未命中的后端补保护
+
+
+def test_环境变量设0_关掉封顶(monkeypatch):
+    monkeypatch.setenv("MECODE_MAX_OUTPUT_TOKENS", "0")
+    assert "max_tokens" not in _payload_for("deepseek-v4-flash")

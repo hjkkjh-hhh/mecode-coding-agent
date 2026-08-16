@@ -1,14 +1,57 @@
-"""系统提示词组装：工具工作流、项目说明加载、静态在前环境在后。"""
+"""系统提示词组装：工具工作流、按可用工具裁剪、项目说明加载、静态在前环境在后。"""
 from mecode.system_prompt import (
     BASE,
+    base_prompt,
     build_system_prompt,
     load_project_context,
 )
 
-
 def test_BASE_含全部工具的工作流():
     for kw in ("read_file", "edit_file", "write_file", "bash", "grep", "glob"):
         assert kw in BASE
+
+
+def test_没禁用任何工具_与BASE一致():
+    assert base_prompt() == BASE == base_prompt([])
+
+
+def test_禁用web工具_联网那条整条消失():
+    """工具被 MECODE_DISABLE_TOOLS 摘掉后，提示词还教模型用它 → 模型照调、拿回"没有这个工具"。
+    实测无外网跑批 80 次，模型仍尝试 web_search 37 次，全部报错收场。"""
+    p = base_prompt(["web_search", "web_fetch"])
+    assert "web_search" not in p and "web_fetch" not in p
+    assert "联网查资料" not in p
+    assert "read_file" in p and "grep" in p                # 其余工作方式不受牵连
+
+
+def test_禁用一半web工具_也整条不发():
+    """"web_search 搜 → web_fetch 读全文"少一半就不成立，发出去是误导。"""
+    assert "联网查资料" not in base_prompt(["web_fetch"])
+    assert "联网查资料" not in base_prompt(["web_search"])
+
+
+def test_禁用任务清单或子agent_各自那条消失():
+    assert "规划复杂任务" not in base_prompt(["task_create"])
+    assert "委派子 agent" not in base_prompt(["subagent"])
+    assert "完成判据" in base_prompt(["task_create", "subagent"])   # 核心条目还在
+
+
+def test_禁用核心工具_不影响其余条目():
+    """核心条目不做条件化（禁用它们等于让 agent 没法干活，不为此保留半份提示词）。"""
+    p = base_prompt(["read_file", "bash", "grep", "glob"])
+    for kw in ("探索", "动手时机", "完成判据", "修改", "验证/执行", "行为准则"):
+        assert kw in p
+
+
+def test_build_system_prompt_默认自己读环境变量(monkeypatch):
+    """调用方不必传：默认就按 MECODE_DISABLE_TOOLS 裁。踩过的坑——原先想按"注册表里有什么"
+    过滤，但 subagent/task_* 是 Agent.__init__ 里注册的、比这里晚，会把那两条误删。"""
+    monkeypatch.setenv("MECODE_DISABLE_TOOLS", "web_search,web_fetch")
+    sp = build_system_prompt(project_context="")
+    assert "web_search" not in sp
+    assert "委派子 agent" in sp and "规划复杂任务" in sp     # 这两条禁不掉，必须还在
+    monkeypatch.delenv("MECODE_DISABLE_TOOLS")
+    assert "web_search" in build_system_prompt(project_context="")
 
 
 def test_load_project_context_读到CLAUDE_md(tmp_path):
