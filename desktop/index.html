@@ -140,10 +140,21 @@ main::-webkit-scrollbar-track, .modal::-webkit-scrollbar-track, .tool pre::-webk
 .modal pre::-webkit-scrollbar-track, .set-main::-webkit-scrollbar-track{background:transparent}
 .rail-foot{border-top:1px solid var(--border-1); padding:8px 10px 10px}
 .sec{padding:8px 6px 4px}
-.sec > h3{margin:0 0 7px; padding:0 6px; font:600 12.5px/1.4 var(--sans); letter-spacing:.04em;
+.sec > h3{margin:0 0 7px; padding:5px 6px; border-radius:8px; cursor:pointer;
+  font:600 12.5px/1.4 var(--sans); letter-spacing:.04em;
   text-transform:uppercase; color:var(--text-2); display:flex; align-items:center; gap:7px}
-.sec .count{margin-left:auto; font:600 11px/1.4 var(--mono); color:var(--text-3);
-  border:1px solid var(--border-2); border-radius:999px; padding:2px 7px; font-variant-numeric:tabular-nums}
+.sec > h3:hover{background:var(--hover); color:var(--text)}
+/* 折叠转角：和左栏工作区同一套（.wsgrp .tw），展开朝下、收起朝右 */
+.sec > h3 .tw{flex:0 0 auto; display:grid; place-items:center; color:var(--text-3);
+  transition:transform .13s}
+.sec > h3 .tw svg{width:12px; height:12px; display:block}
+.sec.fold > h3 .tw{transform:rotate(-90deg)}
+.sec.fold > .body{display:none}
+@media (prefers-reduced-motion:reduce){.sec > h3 .tw{transition:none}}
+/* 计数是"有几条"的读数，该一眼看到。原来 --text-3 + 细边框，深色下糊成一团。 */
+.sec .count{margin-left:auto; font:700 11px/1.4 var(--mono); color:var(--accent);
+  background:var(--accent-soft); border:1px solid transparent; border-radius:999px;
+  padding:2px 7px; font-variant-numeric:tabular-nums}
 .item{font-weight:500; padding:7px 9px; border-radius:8px; cursor:pointer; font-size:13px; color:var(--text-2); line-height:1.5}
 /* 后台任务/清单/workflow 那几列的标题仍夹成一行：它们本来就短，换行只会让整列高矮不齐 */
 .item > :not(.sub):not(.acts):not(.t), #sessions .item{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
@@ -280,7 +291,10 @@ main::-webkit-scrollbar-track, .modal::-webkit-scrollbar-track, .tool pre::-webk
 }
 .topbar .right{margin-left:auto; display:flex; align-items:center; gap:8px}
 
-main{flex:1; overflow-y:auto; padding:14px 22px 6px; min-width:0}
+/* overflow-anchor:none —— 上滑加载更早时我们【自己】补偿滚动位置（见 loadHistory）。
+   浏览器默认还有一套"滚动锚定"也会在内容前插时替你补，两套一起上就是双倍补偿，
+   表现成翻历史时位置乱跳、甚至像滚不动。手动补偿和自动锚定只能留一个。 */
+main{flex:1; overflow-y:auto; overflow-anchor:none; padding:14px 22px 6px; min-width:0}
 .col{max-width:var(--col); margin:0 auto; display:flex; flex-direction:column; gap:16px}
 
 /* 空状态：居中 hero，视线落在输入框上，而不是一片空的对话区 */
@@ -835,10 +849,12 @@ textarea::placeholder{color:var(--text-3)}
 
 <!-- 右栏：任务清单 + 工作流。两块都空时整条收起（见 syncSide）。 -->
 <aside id="side" hidden>
-  <div class="sec" id="sec-tasks"><h3>任务清单 <span class="count" id="n-tasks">0</span></h3>
-    <div id="tasks"></div></div>
-  <div class="sec" id="sec-wf"><h3>工作流 <span class="count" id="n-wf">0</span></h3>
-    <div id="wf"></div></div>
+  <div class="sec" id="sec-tasks" data-fold="tasks">
+    <h3 tabindex="0" role="button">任务清单 <span class="count" id="n-tasks">0</span></h3>
+    <div class="body"><div id="tasks"></div></div></div>
+  <div class="sec" id="sec-wf" data-fold="wf">
+    <h3 tabindex="0" role="button">工作流 <span class="count" id="n-wf">0</span></h3>
+    <div class="body"><div id="wf"></div></div></div>
 </aside>
 
 <script>
@@ -1521,6 +1537,32 @@ setInterval(() => {          // 只改"已 N 秒"这一处文本，不重建 DOM
   });
 }, 1000);
 /** 右栏两块都空 → 整条收起。有一块有内容就展开。 */
+/* 右栏哪两块被收起来了。存 localStorage：展开与否是长期偏好，
+   不该每次刷新都退回默认——常年展开的那块能占掉大半个侧栏。 */
+let secFold = new Set();
+try { secFold = new Set(JSON.parse(localStorage.getItem('mecode-sec-fold') || '[]')); } catch (e) {}
+
+/* 转角箭头在这里补，而不是写死在 HTML 里：图标统一走 IC 表（自绘 SVG），
+   HTML 里再抄一份 path 数据，改图标时必然漏掉一处。 */
+$('side').querySelectorAll('.sec').forEach(sec => {
+  const h = sec.querySelector('h3');
+  h.insertAdjacentHTML('afterbegin', `<span class="tw">${IC.chev}</span>`);
+  const paint = () => {
+    const fold = secFold.has(sec.dataset.fold);
+    sec.classList.toggle('fold', fold);
+    h.setAttribute('aria-expanded', String(!fold));
+  };
+  const toggle = () => {
+    const k = sec.dataset.fold;
+    secFold.has(k) ? secFold.delete(k) : secFold.add(k);
+    try { localStorage.setItem('mecode-sec-fold', JSON.stringify([...secFold])); } catch (e) {}
+    paint();
+  };
+  h.onclick = toggle;
+  h.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); } };
+  paint();
+});
+
 function syncSide(){
   const nT = +$('n-tasks').textContent || 0, nW = +$('n-wf').textContent || 0;
   $('sec-tasks').hidden = !nT;
@@ -1670,6 +1712,9 @@ async function loadHistory(reset){
   const r = await get(`/api/history?before=${histBefore}`);
   if (r.error) return;
   histTotal = r.total; histBefore = r.next_before;
+  // 轮数/工具次数由服务端从 transcript 现数（见 Desk.history）。只在 reset 那次采信：
+  // 翻更早的页时它是同一个全量数，但期间可能已经又跑了一轮，覆盖回去就把新的那轮抹掉了。
+  if (reset) { turns = r.turns || 0; toolCalls = r.tool_calls || 0; renderStat(); }
   if (r.items.length) enterChat();
   renderHistoryPage(r.items, !reset);
   refreshLoadMore();
@@ -1696,10 +1741,18 @@ function refreshLoadMore(){
 // 阈值取 140px 而不是 0：等真正贴顶才开始取，用户已经撞到底了，会有明显的一顿。
 // loadingMore 这把锁不能省——滚动事件一次滑动能连发几十下，没锁就是几十个并发请求，
 // 每个都拿【当时那个】histBefore，同一页会被重复插进去。
+//
+// 还要判【方向】。前插是【故意】不移动视线的（见 loadHistory 的补偿），所以加载完用户
+// 仍停在顶部，下一个 scroll 事件立刻又满足"scrollTop <= 140"——一路把整段历史全拉完、
+// 直接甩到最开头，中途页面还被几十次重排卡住。只认"这一下确实是往上滚的"，
+// 一次手势加载一页；补偿写回去的是更大的 scrollTop，天然不会自触发。
+let lastTop = 1e9;
 $('main').addEventListener('scroll', () => {
-  if (loadingMore || !histBefore || $('main').scrollTop > 140) return;
+  const top = $('main').scrollTop, up = top < lastTop;
+  lastTop = top;
+  if (loadingMore || !histBefore || !up || top > 140) return;
   loadingMore = true;
-  loadHistory(false).finally(() => { loadingMore = false; });
+  loadHistory(false).finally(() => { loadingMore = false; lastTop = $('main').scrollTop; });
 });
 
 // 代码块的复制按钮。渲染出来的节点没法逐个挂 onclick，统一委托到对话列。
@@ -1753,6 +1806,11 @@ es.onmessage = e => {
     case 'resumed':
       curSession = m.session; turns = 0; toolCalls = 0; lastUsage = null;
       $('planbar').hidden = true; pendingPlan = '';      // 换会话先收掉旧的待批条
+      // 上下文环显式清零。applyState 里是 `s.context_tokens || ctxUsed`——那个兜底是
+      // 故意的（压缩后 context_tokens 会先归零、等下次请求才测出新值，期间推 0 会让环
+      // 闪一下"没有上下文"）。但换会话时新会话本来就是 0，兜底就把上一个会话的数粘住了：
+      // 新会话第一条消息发出去之前显示的是旧数，模型答完才跳回真值。
+      ctxUsed = 0; renderRing();
       loadHistory(true).then(() => { $('title').textContent = m.title || '新会话'; });
       get('/api/state').then(applyState);
       break;

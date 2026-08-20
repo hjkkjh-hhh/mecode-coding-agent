@@ -296,6 +296,18 @@ class BackgroundManager:
             return any(t.status == "running" and now >= t.next_checkin_at
                        for t in self._tasks.values())
 
+    def elapsed(self, tid: int) -> int | None:
+        """某【运行中】任务已经跑了多少秒（取整）。不在跑则 None。
+
+        存在的理由：模型没有钟。它只能靠自己记"我调了几次 wait、每次多少秒"来推断
+        过了多久，而 wait_bgtask 根本不等——记出来的账必然是错的。
+        把真实秒数写进工具结果，它就不必记账了。"""
+        with self._lock:
+            task = self._tasks.get(tid)
+            if task is None or task.status != "running":
+                return None
+            return int(task.elapsed())
+
     def check_output(self, tid: int) -> str | None:
         """读某【运行中】后台任务的当前输出快照（check_bgtask 拉取）。不在跑则 None。
         子 agent 无中间日志可看 → 回一句占位（完成后总结会经完成事件返回）。"""
@@ -379,15 +391,24 @@ def background_tools(bg: BackgroundManager) -> list[Tool]:
         out = bg.check_output(tid)
         if out is None:
             return f"没有在运行的后台任务 #{tid}（可能已结束）"
-        return f"[后台任务 #{tid} 当前输出]\n{out or '（暂无输出）'}"
+        # 带上真实已运行秒数：模型没有钟，不给它读数它就只能自己记账，而它记的账是错的
+        return f"[后台任务 #{tid} · 已运行 {bg.elapsed(tid)} 秒 · 当前输出]\n{out or '（暂无输出）'}"
 
     def _wait(args: dict) -> str:
         tid = _tid(args)
         if tid is None:
             return "错误：id 必须是后台任务编号（整数）"
         sec = int(args.get("seconds", DEFAULT_CHECKIN))
-        return (f"好的，{sec} 秒后再来看 #{tid} 的进展" if bg.defer_checkin(tid, sec)
-                else f"没有在运行的后台任务 #{tid}（可能已结束）")
+        run = bg.elapsed(tid)
+        if not bg.defer_checkin(tid, sec):
+            return f"没有在运行的后台任务 #{tid}（可能已结束）"
+        # 【别写成"好的，N 秒后再来看"】——那句话读起来像"已经等过了"，模型会信，
+        # 于是 wait 35 → check → wait 35 之后认定"都 70 秒了"，实际才过两秒。
+        # 说清楚"这次调用没花掉时间"，并给出唯一正确的下一步：收尾、等叫醒。
+        return (f"已把 #{tid} 的下次自动查看安排在 {sec} 秒之后（它到现在已运行 {run} 秒）。\n"
+                f"注意：本次调用【立即返回，没有花掉任何时间】。想让时间过去，唯一的办法是"
+                f"结束本轮——把当前进展告诉用户然后停下；到点或任务结束时系统会自动叫醒你，"
+                f"届时再继续。接着调工具只是空转，时间不会因此流逝。")
 
     return [
         Tool(
@@ -415,8 +436,11 @@ def background_tools(bg: BackgroundManager) -> list[Tool]:
         ),
         Tool(
             name="wait_bgtask",
-            description="对一个仍在运行的后台任务说“过 N 秒再来看”：把下次自动 check-in 推迟到 N 秒后"
-                        "（后续也按这个间隔）。用于任务还在正常跑、你不想频繁被打断时控制查看节奏。",
+            description="给一个仍在运行的后台任务【安排】下次自动查看的时间：推迟到 N 秒后"
+                        "（后续也按这个间隔）。用于任务还在正常跑、你不想频繁被打断时控制查看节奏。"
+                        "【它立即返回、不会阻塞、不会让时间流逝】——不是 sleep。"
+                        "调用后应当结束本轮（把进展告诉用户就停），到点系统会自动叫醒你；"
+                        "接着调工具不会让任务跑得更快，只是空转。",
             parameters={
                 "type": "object",
                 "properties": {

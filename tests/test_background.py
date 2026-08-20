@@ -284,3 +284,34 @@ def test_start_fn自然完成仍算done():
     done = m.drain_completions()
     assert [t.id for t in done] == [tid] and done[0].status == "done"
     assert done[0].output == "汇总报告" and m._killed_notes == []
+
+
+def test_wait_bgtask不能让模型以为时间过去了():
+    """wait_bgtask 立即返回，只是把下次自动 check-in 挪到 N 秒后——它【不等】。
+
+    可它原来回的是"好的，35 秒后再来看 #1 的进展"，读起来完全像"已经等过了"。
+    模型没有钟、只能信这句话，于是 wait 35 → check → wait 35 之后认定"都 70 秒了
+    怎么还没输出"，而实际才过两秒。工具结果必须自己把这件事说破。
+    """
+    import time
+    from mecode.background import background_tools
+    bg = BackgroundManager()
+    tid = bg.start("sleep 5", timeout=30)
+    tools = {t.name: t for t in background_tools(bg)}
+
+    out = tools["wait_bgtask"].handler({"id": tid, "seconds": 35})
+    assert "没有花掉任何时间" in out, out
+    assert "结束本轮" in out, "没告诉模型唯一正确的下一步，它只会继续空转：" + out
+    assert "好的，35 秒后再来看" not in out, "又回到那句像'已经等过了'的话术"
+    # 说明里也得写死，否则模型在【决定调不调】的时候就已经理解错了
+    assert "不会让时间流逝" in tools["wait_bgtask"].description
+
+    # 真实读数：模型不必自己记账（它记的账正是这个 bug 的成因）
+    assert bg.elapsed(tid) is not None
+    time.sleep(1.1)
+    assert bg.elapsed(tid) >= 1
+    assert f"已运行 {bg.elapsed(tid)} 秒" in tools["check_bgtask"].handler({"id": tid})
+
+    bg.kill_all()
+    assert _wait(lambda: not bg.running())
+    assert bg.elapsed(tid) is None                # 不在跑就没有"已运行"这回事

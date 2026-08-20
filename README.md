@@ -51,6 +51,8 @@
 
 `mecode` 开 TUI,`mecode desk` 开桌面端——同一个 Agent、同一套事件流(`events.py`),只是渲染在两个地方。桌面端**零新依赖**:stdlib 的 `ThreadingHTTPServer` + SSE 下行 + POST 上行,不引 Web 框架;前端也没有构建步骤,几个静态文件直接开。
 
+![mecode 桌面端:左栏按工作区分组的会话,工具卡片带摘要、点开看完整参数](docs/desk.png)
+
 两处值得看:
 
 - **信任闸**(三道缺一不可)。服务监听本地端口、且桌面端必然跑在 auto/yolo 档——等于本机任何进程都能驱动 agent 跑任意 bash。浏览器的同源策略也拦不住:跨域 POST 属于简单请求,不触发预检就能发出去,一个恶意网页就能远程操纵你的 agent。所以:启动时生成随机 token 注入进 index.html(**首页本身也要拦**,放行等于把 token 白送)+ Host 头必须是回环地址(挡 DNS rebinding)+ Origin 校验(挡跨站请求)。**只绑 127.0.0.1 本身不够**——同机的其它程序照样连得上。

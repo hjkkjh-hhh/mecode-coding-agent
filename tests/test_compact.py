@@ -309,3 +309,16 @@ def test_救援_同一文件多个区间只占一个文件名额(tmp_path):
                  ("c4", '{"path": "%s", "offset": 500}' % a.as_posix(), "a新"))
     got = [r[2] for r in _rescue_reads(old, ("read_file",), 0, 0, 2)]
     assert got == ["b", "a旧", "a新"], "a 的两段只该占 1 个文件名额，b 仍应收进来"
+
+
+def test_摘要为空就不压缩():
+    """compact() 原来拿到什么就用什么。摘要空（流中途断 / 后端回空 / 用户按了停止）时，
+    它会照样把整段历史换成一个空摘要块——上下文当场清零，比不压缩糟得多。"""
+    msgs = [{"role": "system", "content": "你是助手"},
+            {"role": "user", "content": "问题一"},
+            {"role": "assistant", "content": "回答一"}]
+    for blank in ("", "   \n  ", "<summary></summary>"):
+        assert compact(lambda _m: blank, list(msgs)) is None, f"空摘要 {blank!r} 竟然压成功了"
+    # 非空摘要照常压
+    out = compact(_stub_summary, list(msgs))
+    assert out is not None and any("这是摘要正文" in m.get("content", "") for m in out)

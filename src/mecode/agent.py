@@ -311,6 +311,10 @@ class Agent:
             on_compacted=self._on_compacted,
         )
         if compacted is None:
+            # 打断是唯一需要解释的那种"没压成"：用户刚按了停止，得看到自己按生效了。
+            # 其余情况（历史还太短、摘要没生成出来）由调用方按场景决定要不要说话。
+            if self._interrupt.is_set():
+                yield Notice("已取消压缩，上下文未改动")
             return
         self.messages = compacted
         yield Notice(f"上下文 {'' if self.context_tokens else '约'}{tokens} tokens 接近上限，已压缩旧历史")
@@ -771,12 +775,18 @@ class Agent:
 
     def _summarize(self, summary_messages: list[dict]) -> str:
         """用 provider 跑一次（不带工具），把流式文本累积成摘要。
-        compact() 接收这个函数，从而自身不碰网络、保持纯逻辑、好测。"""
+        compact() 接收这个函数，从而自身不碰网络、保持纯逻辑、好测。
+
+        【必须传 should_stop】：不传的话这次请求谁也停不掉——手动压缩时停止按钮按下去
+        毫无反应，长历史的摘要要跑几十秒，用户只能干等。
+        被打断就返回空串：compact() 见空摘要即判定"本次没压成"、原样保留 messages，
+        绝不能拿半截摘要顶上去（那等于把上下文换成一段不完整的转述）。"""
         parts = []
-        for ev in self.provider.stream(summary_messages, tools=None):
+        for ev in self.provider.stream(summary_messages, tools=None,
+                                       should_stop=self._interrupt.is_set):
             if isinstance(ev, TextDelta):
                 parts.append(ev.text)
-        return "".join(parts)
+        return "" if self._interrupt.is_set() else "".join(parts)
 
     @staticmethod
     def _assistant_msg(text: str, tool_calls: list[ToolCall], reasoning: str = "") -> dict:

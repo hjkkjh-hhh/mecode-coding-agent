@@ -843,7 +843,14 @@ class Desk:
             if self.busy:
                 return False
             self.busy = True
+        # 前端只对 kind=="user" 渲气泡，compact 这一档不渲——不自己发一条的话，
+        # 对话区在整个压缩期间是空的，只有左上角在转，看不出到底在不在干活。
         self.bus.emit({"type": "turn_start", "kind": "compact"})
+        self.bus.emit({"type": "notice", "text": "正在压缩上下文…（可随时点停止）"})
+        # 上一次打断留下的标志必须先清掉，否则摘要请求刚开跑就被判为"已打断"，
+        # 表现成点了压缩什么也没发生。（和 Agent._pre_turn 开轮清标志同一个道理。）
+        self.agent._interrupt.clear()
+        said = False
         try:
             saved = self.agent.config
             self.agent.config = dataclasses.replace(saved, compact_threshold=0.0)
@@ -851,11 +858,19 @@ class Desk:
                 for ev in self.agent._maybe_compact():
                     m = encode(ev)
                     if m is not None:
+                        said = True
                         self.bus.emit(m)
             finally:
                 self.agent.config = saved
         except Exception as e:                      # noqa: BLE001
+            said = True
             self.bus.emit({"type": "notice", "text": f"压缩失败：{type(e).__name__}: {e}"})
+        else:
+            # _maybe_compact 一个事件都没产出 = 没压成，而它只在"被打断"时才自己解释。
+            # 剩下的情况得由这里说清楚，不然用户看到的是"点了没反应"。
+            if not said:
+                self.bus.emit({"type": "notice",
+                               "text": "没有可压缩的内容（历史还太短，或这次摘要没生成出来）"})
         finally:
             with self._lock:
                 self.busy = False
@@ -1238,6 +1253,14 @@ class Desk:
             return {"items": [], "total": 0, "next_before": 0}
         msgs = st.read_transcript_messages()
         total = len(msgs)
+        # 轮数 / 工具次数【从 transcript 现数】，不另存一份计数器。
+        # 前端那两个数原来是页面内的局部变量，刷新就归零、resume 更是从头数起。
+        # transcript 里本来就逐条记着谁说了什么、调了哪些工具——单一真相，数它就行，
+        # 另存计数器只会多一处能和事实对不上的状态。
+        # 轮 = 真正的用户发言；注入的 <system-reminder>（模式提示/任务快照/后台接续）不算。
+        turns = sum(1 for m in msgs if m.get("role") == "user"
+                    and not str(m.get("content") or "").startswith("<system-reminder>"))
+        ncalls = sum(len(m.get("tool_calls") or []) for m in msgs)
         end = max(0, total - before)
         start = max(0, end - limit)
         items = []
@@ -1260,7 +1283,7 @@ class Desk:
             elif role == "tool":
                 items.append({"seq": i, "role": "tool", "text": str(text)[:2000],
                               "tool_call_id": m.get("tool_call_id")})
-        return {"items": items, "total": total,
+        return {"items": items, "total": total, "turns": turns, "tool_calls": ncalls,
                 "next_before": before + (end - start) if start > 0 else 0}
 
     def _swap_agent(self, store: SessionStore, meta: dict | None) -> None:

@@ -338,6 +338,11 @@ def compact(
             + "\n\n重要：不要调用任何工具或函数，只输出摘要文本。"},
     ])
     summary_text = clean_summary(raw_summary)   # 剥 <analysis>、抽 <summary>
+    # 摘要空 = 这次压缩【没成】：流中途断了、后端回了空、或者用户中途按了停止。
+    # 不拦的话下面照样把整段历史换成一个空摘要块——上下文当场清零，比不压缩糟得多。
+    # 返回 None（= 本次不压），调用方保持 messages 原样。
+    if not summary_text.strip():
+        return None
 
     rebuilt: list[dict] = list(messages[:head])  # system prompt
 

@@ -928,3 +928,44 @@ def test_配置里带上模型窗口(desk):
     assert pf["window"] > 0
     # 服务端自己的有效上限就是 min(窗口, CAP)，前端照这个公式算才对得上
     assert pf["context_limit"] == min(pf["window"], pf["context_cap"] or 128_000)
+
+
+def test_压缩过程要在对话里露面(desk):
+    """turn_start 带的是 kind="compact"，而前端只对 kind=="user" 渲气泡——
+    不自己补一条的话，压缩那几十秒对话区完全是空的，只有左上角在转。"""
+    seen = []
+    desk.bus.emit = lambda m: seen.append(m)
+    desk.compact_now()
+    texts = [m.get("text", "") for m in seen if m.get("type") == "notice"]
+    assert any("正在压缩" in t for t in texts), seen
+    # 没压成也要说话，否则看起来就是"点了没反应"
+    assert any("正在压缩" not in t for t in texts), "没压成却一声不吭：" + repr(texts)
+
+
+def test_压缩前先清打断标志(desk):
+    """上一次按停止留下的标志不清掉，摘要请求刚开跑就被判为"已打断"，
+    表现成点了压缩什么也没发生。"""
+    desk.agent._interrupt.set()
+    desk.bus.emit = lambda m: None
+    desk.compact_now()
+    assert not desk.agent._interrupt.is_set()
+
+
+def test_历史带上轮数与工具次数(desk):
+    """前端那两个数原来是页面内的局部变量：刷新就归零、resume 更是从头数起。
+    不另存计数器——transcript 里本来就逐条记着，从它现数，单一真相。"""
+    desk.agent.messages += [
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "bash", "arguments": "{}"}},
+            {"id": "c2", "type": "function", "function": {"name": "grep", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+        {"role": "user", "content": "<system-reminder>模式提示</system-reminder>"},
+        {"role": "user", "content": "第二问"},
+    ]
+    for m in desk.agent.messages[1:]:
+        desk.agent.store.append_transcript(m)
+    r = desk.history()
+    assert r["turns"] == 2, "注入的 <system-reminder> 不该算成一轮用户发言"
+    assert r["tool_calls"] == 2

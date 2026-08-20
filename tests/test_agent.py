@@ -473,6 +473,14 @@ class _RampToolProvider:
         self.seen_msgs = []            # 每次请求时的消息条数（压缩会让它缩水）
 
     def stream(self, messages, tools=None, should_stop=None):
+        # 压缩用的摘要请求是 tools=None 的那一次，得回一段【真的摘要文本】：
+        # 回空的话 compact() 会判定"这次没压成"并原样保留 messages（那条闸是防止
+        # 流断/后端回空时把整段上下文换成一个空摘要）。也不计进 calls/seen_msgs——
+        # 那两个量测的是"工具循环里的请求"，混进摘要请求会让断言量错东西。
+        if tools is None:
+            yield TextDelta("【摘要】前面调了几次工具，还在干活")
+            yield Done(reason="stop")
+            return
         self.calls += 1
         self.seen_msgs.append(len(messages))
         if self.calls <= self.n_tools:
@@ -554,3 +562,48 @@ def test_压缩后重新注入任务清单快照(tmp_path):
     list(a.run_turn("干活"))
     assert any("把活干完" in m.get("content", "") for m in a.messages), \
         "压缩后没把任务清单重新注入 —— 模型会丢掉自己的待办"
+
+
+class _SlowSummaryProvider:
+    """摘要请求会一直吐字，直到 should_stop 说停 —— 用来验证"压缩中途能不能停"。"""
+    def __init__(self):
+        self.summary_calls = 0
+        self.saw_should_stop = None
+
+    def stream(self, messages, tools=None, should_stop=None):
+        if tools is None:                       # 摘要请求
+            self.summary_calls += 1
+            self.saw_should_stop = should_stop
+            for i in range(1000):
+                if should_stop is not None and should_stop():
+                    return                      # provider 的协作式停止：直接不再产出
+                yield TextDelta(f"摘要片段{i} ")
+            yield Done(reason="stop")
+            return
+        yield TextDelta("好的")
+        yield Usage(prompt_tokens=99999, completion_tokens=1, total_tokens=100000)
+        yield Done(reason="stop")
+
+
+def test_压缩中途能停下_且不留半截摘要(tmp_path):
+    """摘要那次请求原来【没传 should_stop】：打断标志置位了它也照跑到底，
+    手动压缩时停止按钮按下去毫无反应，长历史要干等几十秒。
+
+    停下来之后更要紧的是【别把半截摘要顶上去】——那等于把上下文换成一段不完整的转述。
+    约定是返回空串，由 compact() 的空摘要闸判定"本次没压成"、原样保留 messages。
+    """
+    p = _SlowSummaryProvider()
+    a = _ramp_agent(p, context_limit=250, compact_threshold=0.8)
+    a.messages += [{"role": "user", "content": "老问题"},
+                   {"role": "assistant", "content": "老回答"}]
+    a.context_tokens = 9999                       # 已超阈值 → 一定会走压缩
+    before = list(a.messages)
+
+    a._interrupt.set()                            # 模拟用户在压缩过程中按了停止
+    evs = list(a._maybe_compact())
+
+    assert p.summary_calls == 1
+    assert p.saw_should_stop is not None, "摘要请求没传 should_stop —— 停止按钮对它无效"
+    assert a.messages == before, "被打断却还是把（半截）摘要顶上去了"
+    assert any("取消压缩" in getattr(e, "text", "") for e in evs), \
+        "打断后没告诉用户，看起来像点了停止没反应"

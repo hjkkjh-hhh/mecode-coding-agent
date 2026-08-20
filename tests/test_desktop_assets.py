@@ -320,6 +320,16 @@ def test_回显认领是队列不是单槽(html):
         "重连时没清空：断线期间的记号会去认领将来某条同内容的消息，把别人发的那条吃掉"
 
 
+def test_换会话把上下文环清零(html):
+    """applyState 里是 `s.context_tokens || ctxUsed`——那个兜底是故意的（压缩后
+    context_tokens 先归零、等下次请求才测出新值，期间推 0 会让环闪一下"没有上下文"）。
+    但换会话时新会话本来就是 0，兜底会把上一个会话的数粘住：新会话第一条消息发出去
+    之前显示的是旧数（16k），模型答完才跳回真值（7k）。"""
+    blk = re.search(r"case 'resumed':(.*?)break;", html, re.S).group(1)
+    assert "ctxUsed = 0" in blk, "换会话没清零，环会显示上一个会话的用量"
+    assert "s.context_tokens || ctxUsed" in html,         "兜底被删了——压缩后那一小段会闪一下\"没有上下文\""
+
+
 def test_面板重画有过期闸(js):
     """切页签切得快时两次重画并行，先发的请求可能后回来，
     把【上一页的内容】写进去，而左边导航高亮的是新页。"""
@@ -347,3 +357,45 @@ def test_窗口值取服务端的(js):
     前端拿它去算 min(窗口, CAP) 会算出一个比真实值大的触发点。"""
     assert "pf.window" in js
     assert "saved.find(e => e.current)" not in js, "又回去从 saved[] 猜窗口了"
+
+
+def test_换会话清掉上下文环(html):
+    """applyState 里是 `s.context_tokens || ctxUsed`，这个兜底是故意的（压缩后
+    context_tokens 会先归零、等下次请求才测出新值，期间推 0 会让环闪一下"没有上下文"）。
+    但换会话时新会话本来就是 0，兜底就把上一个会话的数粘住了——新会话第一条消息
+    发出去之前显示的是旧数，模型答完才跳回真值。"""
+    body = re.search(r"case 'resumed':(.*?)break;", html, re.S).group(1)
+    assert "ctxUsed = 0" in body, "换会话没清上下文环，会显示上一个会话的用量"
+    assert "s.context_tokens || ctxUsed" in html, \
+        "兜底被删了？压缩后那一小段会闪 0——要留着，只是换会话时显式清零"
+
+
+def test_翻历史不跑飞(html):
+    """两处一起才管用，缺一个都会"往上滚一下就甩到最开头"：
+
+    ① 前插是【故意】不移动视线的，所以加载完用户仍停在顶部，下一个 scroll 事件立刻又满足
+       "scrollTop <= 140" —— 一路把整段历史全拉完。必须判方向，一次手势只加载一页。
+    ② 我们自己在补偿滚动位置，而浏览器默认的滚动锚定也会在内容前插时替你补一次，
+       两套一起上就是双倍补偿，位置乱跳。
+    """
+    css = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
+    main = re.search(r"^main\{([^}]*)\}", css, re.M).group(1)
+    assert "overflow-anchor:none" in main, "没关浏览器的滚动锚定，会和手动补偿双倍叠加"
+    body = re.search(r"\$\('main'\)\.addEventListener\('scroll',(.*?)\n\}\);", html, re.S).group(1)
+    assert "up = top < lastTop" in body, "没判滚动方向，加载完停在顶部会一路自触发到最开头"
+    assert "!up ||" in body, "方向判断没进入闸门条件"
+
+
+def test_右栏两块能收起(html):
+    """常年展开的那块能占掉大半个侧栏；展开与否是长期偏好，要记住。"""
+    assert 'data-fold="tasks"' in html and 'data-fold="wf"' in html
+    assert "mecode-sec-fold" in html, "折叠状态没持久化，刷新就退回默认"
+    assert ".sec.fold > .body{display:none}" in html
+
+
+def test_计数徽标看得清(html):
+    """原来是 --text-3 + 细边框，深色下几乎糊成一团——它是"有几条"的读数，该一眼看到。"""
+    css = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
+    count = re.search(r"\.sec \.count\{([^}]*)\}", css).group(1)
+    assert "color:var(--accent)" in count, count
+    assert "var(--text-3)" not in count
