@@ -151,6 +151,15 @@ _CONTEXT_CAP_DEFAULT = 128_000
 _DEFAULT_LIMIT = 100_000        # 未知/未注册模型的兜底窗口
 
 
+def effective_window(model: str) -> int:
+    """这个模型按多大窗口算。注册表不认识的（自建 / 本地）按兜底值算。
+
+    单独拆出来是因为 UI 也要用它：设置里"上限 × 阈值 = 触发点"那条算式必须和
+    _context_limit 用同一个窗口值，两边各算各的迟早对不上。"""
+    from .registry import context_window_for      # 局部 import：registry 不依赖 config，避免顶层耦合
+    return context_window_for(model) or _DEFAULT_LIMIT
+
+
 def _context_limit(model: str) -> int:
     """压缩用的上下文上限 = min(模型窗口, CAP)。
     CAP 优先级：config.json context_cap（UI 可设，和后端字段同一真相源）> env MECODE_CONTEXT_CAP > 默认 128K
@@ -159,10 +168,9 @@ def _context_limit(model: str) -> int:
     注：曾想给每个后端条目加一个自填 context_window（自建/本地模型注册表不认识 → 按兜底 100K 算，
     压缩永远触发不了）。后来去掉了——最终取的是 min(窗口, CAP)，而 CAP 本来就是 UI 可设的，
     单后端下"填窗口 8192"和"填上限 8192"完全等价，多一个框只是多一个概念。"""
-    from .registry import context_window_for      # 局部 import：registry 不依赖 config，避免顶层耦合
     cap = int(load_user_config().get("context_cap", 0)) or int(os.getenv("MECODE_CONTEXT_CAP", "0")) \
         or _CONTEXT_CAP_DEFAULT
-    return min(context_window_for(model) or _DEFAULT_LIMIT, cap)
+    return min(effective_window(model), cap)
 
 
 def _compact_threshold() -> float:

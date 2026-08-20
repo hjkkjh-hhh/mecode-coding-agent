@@ -13,7 +13,7 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(
         prog="mecode",
         description="mecode 无头一次性调用：跑完打印最终答案退出。"
-                    "（不带任何参数的 mecode 命令则打开 TUI 界面）")
+                    "（mecode 不带参数=打开 TUI；mecode desk=打开桌面端）")
     ap.add_argument("-p", "--print", dest="prompt", required=True,
                     help="要执行的问题/任务")
     ap.add_argument("--mode", default="auto", choices=["normal", "auto", "yolo"],

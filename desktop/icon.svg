@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="mecode">
+  <title>mecode</title>
+  <!-- 标记 = 圆角方 + 终端提示符 >_ 。
+       选它的理由：mecode 是跑在终端里的编程 agent，>_ 是这件事最短的说法，
+       而且它在 16px（浏览器标签页）下仍然认得出——大多数图形到那个尺寸就糊成一团了。
+       光标那一横【比 > 淡】：静止的图里做出"它在等你敲字"的意思。
+       渐变蓝→紫与界面主色（blue-500）同族但不撞，亮/暗两个主题下都压得住。 -->
+  <defs>
+    <linearGradient id="mc-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f8cf9"/>
+      <stop offset="1" stop-color="#7c4dff"/>
+    </linearGradient>
+    <linearGradient id="mc-sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".24"/>
+      <stop offset=".6" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="9" fill="url(#mc-bg)"/>
+  <rect width="32" height="32" rx="9" fill="url(#mc-sheen)"/>
+  <g fill="none" stroke="#fff" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10.6 10.4 16.4 16l-5.8 5.6"/>
+    <path d="M18.9 21.6h3.6" stroke-opacity=".7"/>
+  </g>
+</svg>

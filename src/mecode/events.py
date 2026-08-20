@@ -48,6 +48,7 @@ class Usage:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    reasoning_tokens: int = 0
 
 
 # 下面三个是 Agent 层产出的事件（Provider 不产出），供上层显示工具执行与提示。

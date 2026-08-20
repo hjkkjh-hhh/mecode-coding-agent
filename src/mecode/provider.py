@@ -210,6 +210,10 @@ class Provider:
                     prompt_tokens=usage["prompt_tokens"],
                     completion_tokens=usage.get("completion_tokens", 0),
                     total_tokens=usage.get("total_tokens", 0),
+                    # 思考 token 是 completion 的子集（各家都放在这个嵌套字段里）；
+                    # 没有这个字段的后端拿到 0，上层据此不显示这一项
+                    reasoning_tokens=(usage.get("completion_tokens_details")
+                                      or {}).get("reasoning_tokens", 0) or 0,
                 )
             choices = chunk.get("choices") or []   # 有的 provider 发空 choices 块，跳过
             if not choices:

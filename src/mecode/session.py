@@ -169,6 +169,76 @@ class SessionStore:
         self.session_json.write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _patch_header(self, **fields) -> dict:
+        """读-改-写会话头。读不动就当空 dict 起一份——一个坏文件不该让改名/归档整个失败。"""
+        meta: dict = {}
+        if self.session_json.is_file():
+            try:
+                meta = json.loads(self.session_json.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                meta = {}
+        meta.setdefault("session_id", self.session_id)
+        meta.setdefault("cwd", str(self.cwd))
+        meta.setdefault("slug", project_slug(self.cwd))
+        meta.update(fields)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.session_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+                                     encoding="utf-8")
+        return meta
+
+    def set_title(self, title: str) -> str:
+        """用户手动改名。
+
+        和 write_header(title=...) 分开是【故意的】：那条只在没有标题时才写（首条用户消息自动命名），
+        正是它保证了自动命名不会覆盖用户改过的名字。改名要的是"无条件覆盖"，
+        两种语义塞进一个参数，迟早有一边被写错。
+        改完之后自动命名那条也不会再动它了——它看到 title 已存在就跳过。
+        """
+        title = (title or "").strip()[:80]
+        if not title:
+            raise ValueError("标题不能为空")
+        self._patch_header(title=title)
+        return title
+
+    def set_archived(self, archived: bool) -> None:
+        """归档 / 取消归档。只是给会话头打个标记，transcript 一个字都不动——
+        归档 = 从清单里收起来，不是删除，随时能翻回来。"""
+        self._patch_header(archived=bool(archived))
+
+    def fork(self, title: str = "") -> "SessionStore":
+        """把本会话整个复制成一个新会话（新 uuid），返回新 store。
+
+        【整目录复制】而不是只拷 transcript：外置的大工具输出在 tool_outputs/ 里，
+        不跟过去的话新会话里那些"看全文"全打不开——读取接口把路径限死在【本会话】目录内，
+        指向源会话的绝对路径会被闸直接挡下。
+        复制完还要把 transcript 里写死的旧目录路径改写成新目录，那些指针才对得上。
+
+        用途：想从当前这段对话岔出去试另一条路，又不想弄脏原来那条。
+        """
+        import shutil
+        new = SessionStore(root=self.root, cwd=self.cwd)
+        if self.dir.is_dir():
+            shutil.copytree(self.dir, new.dir, dirs_exist_ok=True)
+        # 外置输出的路径是【复制前就写死在 transcript 里的绝对路径】，指向旧目录。
+        # 正斜杠和反斜杠两种形态都要换：Windows 上两种写法都可能落进去。
+        if new.transcript_path.is_file():
+            text = new.transcript_path.read_text(encoding="utf-8")
+            for old_s, new_s in ((self.dir.as_posix(), new.dir.as_posix()),
+                                 (str(self.dir), str(new.dir))):
+                text = text.replace(old_s, new_s)
+            new.transcript_path.write_text(text, encoding="utf-8", newline="")
+        base = title.strip() or ""
+        if not base:
+            try:
+                base = json.loads(self.session_json.read_text(encoding="utf-8")).get("title", "")
+            except (json.JSONDecodeError, OSError):
+                base = ""
+        now = time.time()
+        new._patch_header(session_id=new.session_id, title=(base or "未命名")[:70] + "（分叉）",
+                          created_at=now, updated_at=now, archived=False,
+                          forked_from=self.session_id)
+        return new
+
     @classmethod
     def list_sessions(cls, root: str | Path | None = None,
                       cwd: str | Path | None = None) -> list[dict]:
@@ -191,6 +261,47 @@ class SessionStore:
             meta.setdefault("session_id", d.name)
             out.append(meta)
         out.sort(key=lambda m: m.get("updated_at", 0), reverse=True)
+        return out
+
+    @classmethod
+    def list_projects(cls, root: str | Path | None = None) -> list[dict]:
+        """所有【工作区】及各自的会话头，按最近活跃排序。
+
+        和 list_sessions 的分工：那个只看当前 cwd 对应的一个项目（resume 用）；
+        这个横扫 projects/ 下的全部（侧栏按文件夹分组用）。
+
+        工作区路径从【会话头里的 cwd】取，不从目录名反推——目录名是 slug（路径压平成
+        C--Users-x-proj 这种），压平是有损的，反推不回原路径。
+        """
+        root = Path(root).expanduser() if root else Path("~/.mecode").expanduser()
+        base = root / "projects"
+        out: list[dict] = []
+        if not base.is_dir():
+            return out
+        for proj in base.iterdir():
+            sdir = proj / "sessions"
+            if not sdir.is_dir():
+                continue
+            metas: list[dict] = []
+            for d in sdir.iterdir():
+                header = d / "session.json"
+                if not header.is_file():
+                    continue
+                try:
+                    meta = json.loads(header.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                meta.setdefault("session_id", d.name)
+                metas.append(meta)
+            if not metas:
+                continue
+            metas.sort(key=lambda m: m.get("updated_at", 0), reverse=True)
+            cwd = metas[0].get("cwd", "")
+            out.append({"slug": proj.name, "cwd": cwd,
+                        "name": Path(cwd).name if cwd else proj.name,
+                        "updated_at": metas[0].get("updated_at", 0),
+                        "sessions": metas})
+        out.sort(key=lambda p: p.get("updated_at", 0), reverse=True)
         return out
 
     # --- 工具权限：项目级规则（跨会话共享），格式 {tool: {"allow":[spec...], "deny":[...]}} ---

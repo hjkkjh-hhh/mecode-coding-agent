@@ -1,0 +1,1961 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mecode</title>
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<style>
+/* 设计 token 两层：raw 调色板 → 语义别名。组件只用语义名，换肤只改别名。
+   结构参考 DeepSeek Harness 的 Web UI：亮色是【平的】（层次靠发丝级 alpha 描边而不是灰阶），
+   暗色才用阶梯抬升；中性色偏蓝。
+
+   主题三态：跟随系统 / 亮 / 暗。三态的 CSS 结构缺一不可——
+     :root                                        亮色（默认，也是"跟随系统 + 系统亮"的样子）
+     @media dark { :root:not([data-theme=light]) } 跟随系统且系统暗；显式选亮时不生效
+     :root[data-theme=dark]                       显式选暗（系统亮也照样暗）
+   跟随系统时【必须把 data-theme 属性摘掉】，写死任何值都会让系统切换失灵。
+   另：颜色一律定义在 :root 层，绝不能只写在 @media/[data-theme] 里——那样在"未标记"
+   状态下该色根本没定义，会出现一半亮一半暗的页面。 */
+:root {
+  --blue-450:#4d93f8; --blue-500:#3b82f6; --blue-50:#eff6ff;
+  --red-500:#e5484d; --amber-500:#f59e0b; --green-500:#10b981;
+
+  --bg-base:#fff; --bg-rail:#fafafa; --bg-layer:#fff; --bg-overlay:#fff; --bg-sunken:#f5f6f8;
+  --text:#16181d; --text-2:#5b6270; --text-3:#8b929e;
+  --border-1:rgba(0,0,0,.06); --border-2:rgba(0,0,0,.10); --border-3:rgba(0,0,0,.16);
+  --hover:rgba(38,49,72,.06); --active:rgba(38,49,72,.10);
+  --accent:var(--blue-500); --accent-soft:var(--blue-50);
+  --danger:var(--red-500); --warn:var(--amber-500); --ok:var(--green-500);
+  --shadow:0 1px 2px rgba(0,0,0,.05), 0 12px 32px rgba(0,0,0,.10);
+
+  --col:748px; --rail:276px; --side:300px;
+  --radius:14px; --radius-sm:8px;
+  --mono:ui-monospace,"Cascadia Code","SF Mono",Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+@media (prefers-color-scheme:dark) {
+  :root:not([data-theme="light"]) {
+    --bg-base:#0d0d10; --bg-rail:#131317; --bg-layer:#1a1a20; --bg-overlay:#1f1f26; --bg-sunken:#161619;
+    --text:#e9ebef; --text-2:#a3a9b5; --text-3:#6f7683;
+    --border-1:rgba(255,255,255,.06); --border-2:rgba(255,255,255,.11); --border-3:rgba(255,255,255,.18);
+    --hover:rgba(255,255,255,.06); --active:rgba(255,255,255,.11);
+    --accent:var(--blue-450); --accent-soft:rgba(77,147,248,.16);
+    --danger:#f2696d;
+    --shadow:0 1px 2px rgba(0,0,0,.4), 0 16px 40px rgba(0,0,0,.5);
+  }
+}
+:root[data-theme="dark"] {
+  --bg-base:#0d0d10; --bg-rail:#131317; --bg-layer:#1a1a20; --bg-overlay:#1f1f26; --bg-sunken:#161619;
+  --text:#e9ebef; --text-2:#a3a9b5; --text-3:#6f7683;
+  --border-1:rgba(255,255,255,.06); --border-2:rgba(255,255,255,.11); --border-3:rgba(255,255,255,.18);
+  --hover:rgba(255,255,255,.06); --active:rgba(255,255,255,.11);
+  --accent:var(--blue-450); --accent-soft:rgba(77,147,248,.16);
+  --danger:#f2696d;
+  --shadow:0 1px 2px rgba(0,0,0,.4), 0 16px 40px rgba(0,0,0,.5);
+}
+
+*{box-sizing:border-box}
+/* hidden 属性必须压过组件自己的 display。
+   UA 样式表的 [hidden]{display:none} 特异性只有 (0,1,0)，和 .circle{display:grid}、
+   .hero{display:flex}、.icon{display:grid} 这类 class 规则打平，写在后面的就赢——
+   于是"隐藏"的按钮照样显示（发送键和停止键同时出现过）。一条兜底规则堵死这一类。 */
+[hidden]{display:none !important}
+html,body{height:100%}
+body{margin:0; background:var(--bg-base); color:var(--text);
+  font:15px/1.7 var(--sans); display:flex; -webkit-font-smoothing:antialiased}
+button{font-family:inherit}
+
+/* ================= 右栏：任务清单 / 工作流 ================= */
+/* 两块都空时整条 hidden——常年空着的一栏白占 300px 宽。
+   有内容才出现，出现时对话区跟着收窄一点，比一直留一片空白强。 */
+#side{flex:0 0 var(--side); width:var(--side); background:var(--bg-rail);
+  border-left:1px solid var(--border-1); display:flex; flex-direction:column;
+  overflow-y:auto; padding:14px 8px 12px; gap:4px;
+  scrollbar-width:none; -ms-overflow-style:none}
+#side::-webkit-scrollbar{width:0}
+#side .sec[hidden]{display:none}
+
+/* ================= 后台任务条 ================= */
+/* 放在输入框正上方：它是"此刻正在跑的东西"，该待在眼睛盯着的地方，
+   而不是塞进左栏——那儿是"翻history"的区域，跑着的任务放进去容易被忘掉。 */
+.bgbar{max-width:calc(var(--col) + 32px); margin:0 auto 8px; display:flex; flex-direction:column;
+  gap:6px; max-height:150px; overflow-y:auto;
+  scrollbar-width:none; -ms-overflow-style:none}
+.bgbar::-webkit-scrollbar{width:0}
+.bgrow{font-weight:500; display:flex; align-items:center; gap:9px; padding:7px 12px; border-radius:10px;
+  border:1px solid var(--border-2); background:var(--bg-layer); font-size:12.5px}
+.bgrow .nm{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  color:var(--text-2)}
+.bgrow .el{font-weight:600; color:var(--text-3); font:11.5px/1.4 var(--mono); font-variant-numeric:tabular-nums;
+  white-space:nowrap; flex:0 0 auto}
+
+/* ================= 左栏 ================= */
+aside{
+  flex:0 0 var(--rail); width:var(--rail); background:var(--bg-rail);
+  border-right:1px solid var(--border-1); display:flex; flex-direction:column;
+  position:relative;
+}
+/* 拖宽把手：贴在右边界上，比边框宽一点才好抓（4px 的边太难点中），
+   但要压在边框上方而不是占位——占位会把内容往左挤 4px。 */
+.grip{position:absolute; top:0; right:-3px; bottom:0; width:7px; z-index:5;
+  cursor:col-resize; touch-action:none}
+.grip::after{content:""; position:absolute; inset:0 3px; background:transparent; transition:background .12s}
+.grip:hover::after, .grip.on::after{background:var(--accent)}
+/* 拖动中：全局禁选，否则横向拖会把侧栏文字整片选蓝 */
+body.resizing{user-select:none; cursor:col-resize}
+@media (prefers-reduced-motion:reduce){.grip::after{transition:none}}
+.rail-top{display:flex; align-items:center; gap:8px; padding:14px 14px 10px}
+/* flex 行：.mark 是 display:block，普通流里会独占一行、把 mecode 挤到下一行 */
+.logo{font-weight:680; letter-spacing:-.02em; font-size:16px;
+  display:flex; align-items:center; gap:8px}
+.logo b{color:var(--accent)}
+.icon{width:30px; height:30px; border:0; border-radius:9px; cursor:pointer;
+  background:transparent; color:var(--text-3); display:grid; place-items:center; padding:0}
+.icon svg{width:18px; height:18px; display:block}
+.rail-top .icon{margin-left:auto}
+.icon:hover{background:var(--hover); color:var(--text)}
+.newbtn{margin:0 14px 12px; padding:9px 12px; border:1px solid var(--border-2); border-radius:10px;
+  background:var(--bg-layer); color:var(--text); cursor:pointer;
+  font:600 13px/1.4 var(--sans); display:flex; align-items:center; justify-content:center; gap:7px}
+.newbtn:hover{background:var(--hover)}
+/* 图标槽：SVG 由 JS 统一填（见 IC），HTML 里只留位置——两处各写一份形状迟早对不上 */
+.newbtn .ig{display:grid; place-items:center; flex:0 0 auto}
+.newbtn .ig svg{width:15px; height:15px; display:block}
+/* 侧栏滚动条藏掉：这一栏本来就是"扫一眼"的区域，一条常驻的粗滚动条比它承载的信息还抢眼。
+   仍可滚（overflow:auto 没动），只是不画滚动条。 */
+.rail-body{flex:1; overflow-y:auto; padding:0 8px 8px;
+  scrollbar-width:none; -ms-overflow-style:none}
+.rail-body::-webkit-scrollbar{width:0; height:0}
+
+/* 其余可滚区域（对话流、工具输出、弹窗）：不去掉，但收细、压低对比——
+   默认那条又宽又亮，在暗色底上尤其刺眼。 */
+main, .modal, .tool pre, .modal pre, .set-main{scrollbar-width:thin; scrollbar-color:var(--border-3) transparent}
+main::-webkit-scrollbar, .modal::-webkit-scrollbar, .tool pre::-webkit-scrollbar,
+.modal pre::-webkit-scrollbar, .set-main::-webkit-scrollbar{width:8px; height:8px}
+main::-webkit-scrollbar-thumb, .modal::-webkit-scrollbar-thumb, .tool pre::-webkit-scrollbar-thumb,
+.modal pre::-webkit-scrollbar-thumb, .set-main::-webkit-scrollbar-thumb{
+  background:var(--border-3); border-radius:4px}
+main::-webkit-scrollbar-track, .modal::-webkit-scrollbar-track, .tool pre::-webkit-scrollbar-track,
+.modal pre::-webkit-scrollbar-track, .set-main::-webkit-scrollbar-track{background:transparent}
+.rail-foot{border-top:1px solid var(--border-1); padding:8px 10px 10px}
+.sec{padding:8px 6px 4px}
+.sec > h3{margin:0 0 7px; padding:0 6px; font:600 12.5px/1.4 var(--sans); letter-spacing:.04em;
+  text-transform:uppercase; color:var(--text-2); display:flex; align-items:center; gap:7px}
+.sec .count{margin-left:auto; font:600 11px/1.4 var(--mono); color:var(--text-3);
+  border:1px solid var(--border-2); border-radius:999px; padding:2px 7px; font-variant-numeric:tabular-nums}
+.item{font-weight:500; padding:7px 9px; border-radius:8px; cursor:pointer; font-size:13px; color:var(--text-2); line-height:1.5}
+/* 后台任务/清单/workflow 那几列的标题仍夹成一行：它们本来就短，换行只会让整列高矮不齐 */
+.item > :not(.sub):not(.acts):not(.t), #sessions .item{overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+#sessions .item .sub{white-space:nowrap}
+/* 会话标题给两行：第一句用户输入常常就是一整段，一行截断后几条长得一模一样、分不出谁是谁。
+   选择器带上 #sessions（1,0,2）才压得过上面那条 nowrap。 */
+#sessions .item .t{white-space:normal; overflow:hidden; display:-webkit-box;
+  -webkit-line-clamp:2; -webkit-box-orient:vertical; word-break:break-word}
+.item:hover{background:var(--hover)}
+.item.cur{background:var(--active); color:var(--text)}
+.item .sub{color:var(--text-3); font:600 11.5px/1.5 var(--mono); font-variant-numeric:tabular-nums}
+.item .acts{display:flex; gap:6px; margin-top:5px}
+
+/* 会话行底部：左边用量/模式，右边"多久以前"。
+   鼠标停上去时间换成三点菜单——两者【占同一个位置】而不是并排：
+   并排的话平时右下角就挂着一个跟内容无关的按钮，一直在抢注意力。 */
+/* min-height 顶住行高：三点按钮(22px)比时间那行文字(~16px)高，不给下限的话
+   鼠标一进来卡片就往下长一截、整列跟着跳。 */
+#sessions .item .sub{display:flex; align-items:center; gap:8px; min-height:22px}
+#sessions .item .ago{margin-left:auto; white-space:nowrap}
+/* 26x22 的点击区：图标本身 16px，四周留白让它好点中。
+   显示态用 grid 而不是 block——要靠 place-items 把图标居中。 */
+#sessions .item .kebab{margin-left:auto; display:none; place-items:center; border:0;
+  background:transparent; color:var(--text-3); cursor:pointer; border-radius:7px;
+  padding:0; width:26px; height:22px}
+#sessions .item .kebab svg{width:16px; height:16px; display:block}
+#sessions .item .kebab:hover{background:var(--border-2); color:var(--text)}
+#sessions .item:hover .ago, #sessions .item:focus-within .ago{display:none}
+#sessions .item:hover .kebab, #sessions .item:focus-within .kebab{display:grid}
+
+/* 菜单项：图标 + 文字，图标固定宽度好让文字对齐 */
+.pop .mi{display:flex; align-items:center; gap:10px; width:100%; border:0; background:transparent;
+  color:var(--text); cursor:pointer; border-radius:8px; padding:8px 12px;
+  font:500 13px/1.5 var(--sans); text-align:left; white-space:nowrap}
+.pop .mi:hover{background:var(--hover)}
+.pop .mi svg{width:15px; height:15px; flex:0 0 auto; color:var(--text-3)}
+.pop .mi.danger{color:var(--danger)}
+.pop .mi.danger svg{color:var(--danger)}
+
+/* 已归档视图的开关，挂在"会话"那行标题右边 */
+.sec .lnk{border:0; background:transparent; color:var(--text-3); cursor:pointer;
+  font:600 11.5px/1.4 var(--sans); letter-spacing:.02em; padding:3px 7px; border-radius:6px}
+.sec .lnk.ico{padding:0; width:22px; height:20px; display:grid; place-items:center}
+.sec .lnk.ico svg{width:14px; height:14px; display:block}
+
+/* 工作区分组头：一个文件夹一组。当前那个高亮，点别的组就切过去。 */
+.wsgrp{display:flex; align-items:center; gap:7px; padding:7px 8px 5px; cursor:pointer;
+  border-radius:8px; color:var(--text-2); font:600 12.5px/1.4 var(--sans)}
+.wsgrp:hover{background:var(--hover); color:var(--text)}
+.wsgrp.cur{color:var(--text)}
+.wsgrp svg{width:14px; height:14px; flex:0 0 auto; color:var(--text-3)}
+/* 展开时朝下、折叠时朝右。自绘 chevron 画的是【朝右】那一版，展开态转 90°。 */
+.wsgrp .tw{flex:0 0 auto; color:var(--text-2); display:grid; place-items:center;
+  transition:transform .14s; transform:rotate(90deg)}
+.wsgrp .tw svg{width:12px; height:12px; display:block}
+.wsgrp.fold .tw{transform:rotate(0deg)}
+/* "进入此工作区"：平时藏着。点组里的会话本来就会自动切过去，
+   这个按钮主要是给【还没有任何会话的空工作区】留的唯一入口。 */
+.wsgrp .go{opacity:0; border:0; background:transparent; color:var(--text-2); cursor:pointer;
+  border-radius:6px; padding:0; width:22px; height:20px; display:grid; place-items:center}
+.wsgrp .go svg{width:14px; height:14px; display:block}
+.wsgrp:hover .go{opacity:1}
+.wsgrp .go:hover{background:var(--border-2); color:var(--text)}
+.wsgrp.cur .go{display:none}
+@media (prefers-reduced-motion:reduce){.wsgrp .tw{transition:none}}
+.wsgrp.cur svg{color:var(--accent)}
+.wsgrp .nm{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.wsgrp .n{font:600 10.5px/1.4 var(--mono); color:var(--text-3)}
+/* 组内会话缩进：靠一条竖线挂在文件夹下面，不用缩进堆叠（窄侧栏下会把标题挤没） */
+.wsbody{margin:0 0 4px 15px; padding-left:9px; border-left:1px solid var(--border-1)}
+
+/* 标题左边的运行动画：三个点依次起伏 */
+.runner{display:flex; align-items:center; gap:3px; flex:0 0 auto}
+.runner i{width:5px; height:5px; border-radius:50%; background:var(--accent);
+  animation:bob 1.05s ease-in-out infinite}
+.runner i:nth-child(2){animation-delay:.14s}
+.runner i:nth-child(3){animation-delay:.28s}
+@keyframes bob{0%,70%,100%{transform:translateY(0); opacity:.35}
+               35%{transform:translateY(-4px); opacity:1}}
+@media (prefers-reduced-motion:reduce){.runner i{animation:none; opacity:.7}}
+
+/* 文件夹选择器 */
+.picker{max-height:320px; overflow-y:auto; border:1px solid var(--border-1); border-radius:10px}
+.pkrow{font-weight:500; display:flex; align-items:center; gap:9px; padding:8px 12px; cursor:pointer;
+  border-bottom:1px solid var(--border-1); font-size:13px}
+.pkrow:last-child{border-bottom:0}
+.pkrow:hover{background:var(--hover)}
+.pkrow svg{width:15px; height:15px; flex:0 0 auto; color:var(--text-3)}
+.pkpath{font-weight:500; font:12px/1.6 var(--mono); color:var(--text-2); word-break:break-all;
+  background:var(--bg-sunken); border:1px solid var(--border-1); border-radius:8px; padding:8px 11px}
+.sec .lnk:hover{background:var(--hover); color:var(--text-2)}
+.sec .lnk.on{background:var(--active); color:var(--text)}
+.mini{border:1px solid var(--border-2); background:transparent; color:var(--text-3);
+  border-radius:6px; padding:2px 7px; font:500 11px/1.5 var(--sans); cursor:pointer}
+.mini:hover{background:var(--hover); color:var(--text)}
+.empty{font-weight:500; color:var(--text-3); font-size:12.5px; padding:3px 9px 6px}
+.pip{width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:7px;vertical-align:1px}
+.pip.running,.pip.in_progress{background:var(--accent)}
+.pip.done,.pip.completed{background:var(--ok)}
+.pip.failed{background:var(--danger)} .pip.pending{background:var(--text-3)}
+.stage{font-weight:500; padding:5px 9px; font-size:12.5px; color:var(--text-2)}
+.stage.dep{border-left:2px solid var(--border-2); margin-left:12px; padding-left:10px}
+.foot-btn{width:100%; border:0; background:transparent; color:var(--text-2); cursor:pointer;
+  padding:11px 12px; border-radius:10px; text-align:left; font:500 13.5px/1.5 var(--sans);
+  display:flex; align-items:center; gap:10px}
+.foot-btn:hover{background:var(--hover); color:var(--text)}
+.foot-btn svg{width:18px; height:18px; flex:0 0 auto}
+
+/* ================= 主区 ================= */
+.stage-area{flex:1; display:flex; flex-direction:column; min-width:0}
+.topbar{flex:0 0 auto; display:flex; align-items:center; gap:12px; padding:12px 22px 0; min-height:52px}
+.title{font:600 14px/1.4 var(--sans); max-width:44ch; overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap}
+.tag{font-weight:600; color:var(--text-3); font-size:12.5px; display:flex; align-items:center; gap:5px}
+
+/* 连接/运行状态灯。三种态各有颜色，光看字面分不出"在跑"和"没在跑"。 */
+/* 呼吸灯点。独立成类：顶栏状态、工具"运行中"、后台任务条都用它，
+   基础样式绑在 .conn 下面的话，另外两处那个点没有尺寸 = 等于不存在。 */
+.cpip{position:relative; width:7px; height:7px; border-radius:50%; flex:0 0 auto;
+  background:var(--text-3)}
+.conn.run{color:var(--ok)} .conn.run .cpip{background:var(--ok)}
+.conn.off{color:var(--danger)} .conn.off .cpip{background:var(--danger)}
+/* 光晕【另起一层】向外扩，不缩放圆点本身：缩放圆点会撑动 flex 行的高度，整条状态栏跟着抖。
+   ::after 是绝对定位的，脱离布局流，怎么放大都不影响旁边的字。 */
+.spin .cpip, .bgrow .cpip{background:var(--ok)}
+.conn.run .cpip::after, .spin .cpip::after, .bgrow .cpip::after{content:""; position:absolute;
+  inset:0; border-radius:50%; background:var(--ok);
+  animation:ping 1.5s cubic-bezier(0,0,.2,1) infinite}
+@keyframes ping{0%{transform:scale(1); opacity:.6} 70%,100%{transform:scale(2.8); opacity:0}}
+@media (prefers-reduced-motion:reduce){
+  /* 不动，但留一圈淡光晕——仍然看得出"在跑"，只是不闪 */
+  .conn.run .cpip::after, .spin .cpip::after,
+  .bgrow .cpip::after{animation:none; opacity:.28; transform:scale(2)}
+}
+.topbar .right{margin-left:auto; display:flex; align-items:center; gap:8px}
+
+main{flex:1; overflow-y:auto; padding:14px 22px 6px; min-width:0}
+.col{max-width:var(--col); margin:0 auto; display:flex; flex-direction:column; gap:16px}
+
+/* 空状态：居中 hero，视线落在输入框上，而不是一片空的对话区 */
+.hero{flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:14px; padding:0 22px}
+.hero h1{margin:0; font:600 26px/1.3 var(--sans); letter-spacing:-.02em;
+  display:flex; align-items:center; gap:12px}
+/* 字标图形：flex 里给 flex:0 0 auto，否则窄侧栏下会被压扁成一条 */
+.mark{flex:0 0 auto; border-radius:6px; display:block}
+/* 字标文字必须裹成【一个】flex 项。裸文字会被包成匿名 flex 项，
+   于是 gap 也加在 me↔code 之间，看着像多敲了个空格。 */
+.wm{white-space:nowrap}
+.mark.lg{border-radius:11px; margin-right:2px}
+.badge{font:600 11px/1.4 var(--sans); color:var(--text-2); background:var(--bg-layer);
+  border:1px solid var(--border-2); border-radius:999px; padding:5px 9px}
+.hero .sub{font-weight:500; color:var(--text-3); font-size:13.5px}
+
+/* ---- 消息：用户右对齐气泡，助手满宽纯文本 ---- */
+/* contain:layout style —— 底部输入框变高时，浏览器不必回头重算每条消息内部的排版。
+   对话长了（几十个工具卡片、代码块、表格）这一条能省掉大量无谓回流。
+   不加 paint：那会裁掉溢出，工具卡片自己已经管了裁剪。 */
+.msg{display:flex; flex-direction:column; gap:8px; contain:layout style}
+.msg.user{align-items:flex-end}
+.msg.user .bubble{background:var(--bg-layer); border:1px solid var(--border-1);
+  border-radius:16px; padding:10px 15px; max-width:82%;
+  white-space:pre-wrap; word-break:break-word}
+.msg.user.queued .bubble{border-style:dashed; opacity:.7}
+.msg.bot .bubble{white-space:pre-wrap; word-break:break-word}
+/* 一律靠右。助手消息是满宽的，.acts 默认 justify-content:flex-start 会把按钮丢在最左边，
+   离刚读完的那段文字最远。用户气泡本来就靠右，这条对它是无副作用的。 */
+.msg .acts{display:flex; gap:2px; opacity:0; transition:opacity .12s; justify-content:flex-end}
+.msg:hover .acts{opacity:1}
+@media (prefers-reduced-motion:reduce){.msg .acts{transition:none}}
+.act{border:1px solid transparent; background:transparent; color:var(--text-3); cursor:pointer;
+  border-radius:9px; padding:5px 8px; display:grid; place-items:center}
+.act svg{width:14px; height:14px; display:block}
+.act:hover{background:var(--hover); border-color:var(--border-2); color:var(--text)}
+
+/* 思考：一行折叠预览，展开才铺全文——长思考铺开会把答案挤没 */
+details.think{color:var(--text-3)}
+details.think > summary{font-weight:500; cursor:pointer; list-style:none; display:flex; gap:8px;
+  align-items:baseline; font-size:13px}
+details.think > summary::-webkit-details-marker{display:none}
+details.think .lbl{color:var(--text-2); font-weight:600; flex:0 0 auto}
+details.think .peek{overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1}
+details.think[open] .peek{display:none}
+details.think .full{display:none; margin-top:8px; padding-left:14px;
+  border-left:2px solid var(--border-2); white-space:pre-wrap; font-size:13.5px; color:var(--text-2)}
+details.think[open] .full{display:block}
+
+/* contain:paint —— 反复开合会留下上一帧的残影（summary 重复一遍、正文从中间截断）。
+   成因是"圆角 + overflow:hidden 的裁剪层"套着一个可滚动的 <pre>：裁剪需要单独一层，
+   details 开合时那一层被复用而没重绘。contain:paint 明确告诉浏览器
+   "这个盒子外面不会画任何东西"，它就会当独立绘制区处理，脏区域算得准，残影消失。 */
+.tool{border:1px solid var(--border-1); border-radius:10px; overflow:hidden;
+  background:var(--bg-layer); contain:paint}
+/* 【基线对齐】而不是居中对齐。摘要行里三段文字用的字体不一样
+   （工具名/限定语是等宽，摘要是无衬线），两种字体的 ascent 比例不同：
+   即使把行盒调成一样高，居中之后各自的基线仍然错开——看着就是"描述比工具名低一点"。
+   baseline 让三段文字落在同一条基线上，字体不同也对得齐。
+   图标和箭头没有文字基线可言，单独 align-self:center 回到居中。 */
+.tool > summary{cursor:pointer; padding:8px 12px; display:flex; align-items:baseline; gap:9px;
+  font:500 13px/1.5 var(--sans); list-style:none}
+.tool .ticon, .tool .caret, .tool .spin{align-self:center}
+.tool > summary::-webkit-details-marker{display:none}
+.tool > summary:hover{background:var(--hover)}
+/* 圆角方块图标：把工具按"它干什么"分了几类，扫一眼就知道这步是读、是写还是跑命令 */
+.tool .ticon{flex:0 0 auto; width:22px; height:22px; border-radius:7px; display:grid;
+  place-items:center; background:var(--bg-sunken); border:1px solid var(--border-1);
+  color:var(--text-2)}
+.tool .ticon svg{width:13px; height:13px; display:block}
+.tool.k-write .ticon{color:var(--warn)} .tool.k-run .ticon{color:var(--accent)}
+.tool.k-net .ticon{color:var(--ok)}
+/* 摘要行里几段文字的【行高统一写死成 px】。
+   原来各写各的倍数（12.5px/1.5 vs 13px/1.5），行盒高度就差了 0.75px；
+   summary 是 align-items:center，行盒一不等高，居中之后基线就错开——
+   看上去就是"描述比工具名低一点"。写死同一个 px 值，三段的行盒完全一样高。 */
+.tool .name{font:600 12.5px/18px var(--mono); color:var(--accent); flex:0 0 auto}
+/* 摘要分两段：主体吃满剩余宽度、放不下才省略；限定语贴右，定长、永不省略。
+   合成一串的话，被省略号切掉的往往正是后半截那个定长信息（行范围/字数）。 */
+.tool .arg{color:var(--text); font:500 13px/18px var(--sans);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0}
+.tool .argx{color:var(--text-2); font:600 12px/18px var(--mono); font-variant-numeric:tabular-nums;
+  white-space:nowrap; flex:0 0 auto}
+/* 自绘 chevron 而不是 › 字符：字符的粗细由系统字体定，等宽字体里 font-weight 几乎没效果。
+   自己画就能把 stroke-width 定死，多大都一样清楚。 */
+.tool .caret{flex:0 0 auto; color:var(--text-2); display:grid; place-items:center;
+  transition:transform .15s}
+.tool .caret svg{width:13px; height:13px; display:block}
+.tool[open] .caret{transform:rotate(90deg)}
+@media (prefers-reduced-motion:reduce){.tool .caret{transition:none}}
+/* 展开区：参数和结果并列，各带一个小标题——不标的话两坨等宽的等宽字分不清谁是谁 */
+.tool .tsec{border-top:1px solid var(--border-1)}
+.tool .tsec h5{margin:0; padding:7px 12px 0; font:700 11px/1.4 var(--sans);
+  letter-spacing:.06em; color:var(--text-2); text-transform:uppercase}
+/* 工具跑着的时候：和顶栏状态灯同一套语义（绿点在呼吸 = 有东西在跑） */
+.tool .spin{color:var(--ok); font:600 11.5px/1.5 var(--sans); display:flex; align-items:center; gap:6px;
+  flex:0 0 auto}
+/* overflow 两轴都写死：只写 overflow-x 时 overflow-y 会被隐式提成 auto，
+   隐式来的那一轴在某些重绘路径上不建滚动层，正是上面那个残影的帮凶。 */
+.tool pre{margin:0; padding:8px 12px 12px; background:transparent;
+  font:12.5px/1.65 var(--mono); overflow:auto; max-height:340px; white-space:pre-wrap;
+  overscroll-behavior:contain; color:var(--text)}
+.tool .tout{background:var(--bg-sunken)}
+.tool .tsec:has(.tout){background:var(--bg-sunken)}
+.more{display:block; width:100%; text-align:left; border:0; border-top:1px solid var(--border-1);
+  background:transparent; color:var(--accent); cursor:pointer; font:500 12px/1.4 var(--sans); padding:9px 12px}
+.more:hover{background:var(--hover)}
+.notice{font-weight:500; color:var(--text-2); font-size:13.5px; border-left:2px solid var(--warn); padding:2px 0 2px 12px}
+.sysline{font-weight:500; color:var(--text-3); font-size:12.5px; text-align:center}
+.loadmore{align-self:center}
+code{font-family:var(--mono); font-size:.9em; background:var(--bg-sunken);
+  border:1px solid var(--border-1); border-radius:5px; padding:1px 5px}
+
+/* ---- Markdown 渲染（.bubble.md）----
+   助手气泡默认是 pre-wrap 纯文本；一旦按 Markdown 渲染就得关掉 pre-wrap，
+   否则标签之间的换行会变成真空行，整段被撑开一倍。 */
+/* 选择器要和 .msg.bot .bubble 同级（0,3,0），不然权重压不过它、pre-wrap 关不掉：
+   Markdown 渲出来的标签之间那些换行会全变成真空行，整段被撑开一倍。 */
+.msg.bot .bubble.md,.bubble.md{white-space:normal}
+.bubble.md > :first-child{margin-top:0}
+.bubble.md > :last-child{margin-bottom:0}
+.bubble.md p{margin:0 0 10px}
+.bubble.md h1,.bubble.md h2,.bubble.md h3,
+.bubble.md h4,.bubble.md h5,.bubble.md h6{margin:20px 0 9px; font-weight:650; line-height:1.35;
+  letter-spacing:-.01em}
+.bubble.md h1{font-size:1.42em} .bubble.md h2{font-size:1.24em} .bubble.md h3{font-size:1.1em}
+.bubble.md h4,.bubble.md h5,.bubble.md h6{font-size:1em; color:var(--text-2)}
+/* 一、二级标题给一条发丝分隔线：长回答里靠它一眼分段 */
+.bubble.md h1,.bubble.md h2{padding-bottom:6px; border-bottom:1px solid var(--border-1)}
+.bubble.md ul,.bubble.md ol{margin:0 0 10px; padding-left:1.5em}
+.bubble.md li{margin:3px 0}
+.bubble.md li > ul,.bubble.md li > ol{margin:3px 0}
+.bubble.md li > p{margin:0 0 6px}
+.bubble.md li::marker{color:var(--text-3)}
+/* 任务项：自绘方块，不用 <input type=checkbox>——那玩意可点可改，而它只是渲染出来的静态内容 */
+.bubble.md li.md-task{list-style:none; margin-left:-1.15em; display:flex; gap:8px; align-items:baseline}
+.bubble.md .md-box{flex:0 0 auto; width:14px; height:14px; border:1.5px solid var(--border-3);
+  border-radius:4px; font:700 10px/12px var(--sans); text-align:center; color:transparent}
+.bubble.md li.md-task.done .md-box{background:var(--ok); border-color:var(--ok); color:#fff}
+.bubble.md li.md-task.done{color:var(--text-3)}
+.bubble.md blockquote{margin:0 0 10px; padding:2px 0 2px 14px; color:var(--text-2);
+  border-left:3px solid var(--border-2)}
+.bubble.md hr{border:0; border-top:1px solid var(--border-1); margin:18px 0}
+.bubble.md a{color:var(--accent); text-decoration:none; border-bottom:1px solid transparent}
+.bubble.md a:hover{border-bottom-color:currentColor}
+.bubble.md strong{font-weight:650} .bubble.md del{color:var(--text-3)}
+/* 表格：自己带横向滚动容器，宽表不能把整页顶宽 */
+.bubble.md .md-tw{overflow-x:auto; margin:0 0 12px; border:1px solid var(--border-1);
+  border-radius:10px}
+.bubble.md table{font-weight:500; border-collapse:collapse; width:100%; font-size:13.5px}
+.bubble.md th,.bubble.md td{padding:7px 12px; border-bottom:1px solid var(--border-1);
+  text-align:left; vertical-align:top}
+.bubble.md thead th{background:var(--bg-sunken); font-weight:600; white-space:nowrap}
+.bubble.md tbody tr:last-child td{border-bottom:0}
+/* 代码块：语言角标 + 悬停才出现的复制按钮（常驻会跟代码抢注意力） */
+/* 同 .tool：圆角裁剪层套可横滚的 <pre>，不加 contain 会留残影 */
+.bubble.md .md-code{position:relative; margin:0 0 12px; border:1px solid var(--border-1);
+  border-radius:10px; background:var(--bg-sunken); overflow:hidden; contain:paint}
+.bubble.md .md-code::before{content:attr(data-lang); position:absolute; top:7px; left:12px;
+  font:600 10.5px/1 var(--mono); color:var(--text-3); letter-spacing:.04em; text-transform:uppercase}
+.bubble.md .md-code[data-lang]{padding-top:10px}
+.bubble.md .md-code pre{margin:0; padding:11px 13px; overflow-x:auto;
+  font:12.5px/1.65 var(--mono); white-space:pre}
+.bubble.md .md-code code{background:none; border:0; padding:0; font-size:inherit}
+/* inline-flex + center：按钮是绝对定位的块盒，文字只按 line-height 落基线，
+   行高和 padding 一配不准就偏上。交给 flex 居中，多长的字都稳。 */
+.md-cp{position:absolute; top:6px; right:6px; z-index:1; opacity:0; transition:opacity .12s;
+  border:1px solid var(--border-2); background:var(--bg-layer); color:var(--text-2);
+  border-radius:6px; padding:0 9px; height:22px; font:500 11.5px var(--sans); cursor:pointer;
+  display:inline-flex; align-items:center; justify-content:center}
+.md-code:hover .md-cp,.md-cp:focus-visible{opacity:1}
+.md-cp:hover{background:var(--hover); color:var(--text)}
+@media (prefers-reduced-motion:reduce){.md-cp{transition:none}}
+
+
+/* ---- 设置面板 ---- */
+.modal.settings{width:min(880px,100%); padding:0; gap:0}
+/* 【定高】。原来是 min-height/max-height，高度跟着内容走——"通用"矮、"模型"高，
+   来回点页签窗口就在跳。设置窗是要来回切的，尺寸稳定比"贴合内容"重要。 */
+.set-body{height:min(78vh,720px)}
+.set-main{scroll-behavior:smooth}
+.set-load{font-weight:500; color:var(--text-3); font-size:13px; padding:24px 0}
+.set-sec{padding:18px 0 4px; border-top:1px solid var(--border-1)}
+.set-sec:first-child{border-top:0; padding-top:4px}
+.set-sec h4{margin:0 0 10px; font:650 13px/1.4 var(--sans); display:flex; align-items:center; gap:8px}
+.set-sec h4 .n{color:var(--text-3); font-weight:500}
+
+/* 当前后端：一眼看清"现在连的是谁、还能聊多久" */
+.cur-be{border:1px solid var(--border-2); border-radius:12px; padding:14px 16px; margin:4px 0 4px;
+  background:var(--bg-sunken)}
+.cur-be .m{font:650 15px/1.4 var(--sans)}
+.cur-be .u{font-weight:500; color:var(--text-2); font:12.5px/1.5 var(--mono); margin-top:3px; word-break:break-all}
+.cur-be .k{font-weight:500; color:var(--text-3); font-size:12px; margin-top:7px}
+.cur-be .k.warn{color:var(--warn)}
+
+/* 列表行：左边信息、右边操作 */
+.lst{display:flex; flex-direction:column; border:1px solid var(--border-1); border-radius:10px;
+  overflow:hidden}
+.lrow{display:flex; align-items:center; gap:12px; padding:11px 14px;
+  border-bottom:1px solid var(--border-1)}
+.lrow:last-child{border-bottom:0}
+.lrow:hover{background:var(--hover)}
+.lrow.cur{background:var(--accent-soft)}
+.lrow.off{opacity:.5}
+.lmain{flex:1; min-width:0}
+.ln{font:600 13.5px/1.5 var(--sans); display:flex; align-items:center; gap:7px; flex-wrap:wrap}
+.ld{font-weight:500; color:var(--text-2); font-size:12.5px; margin-top:2px; word-break:break-word}
+.ld.mono{font-weight:500; font-family:var(--mono); font-size:11.5px; color:var(--text-3)}
+.lp{font-weight:500; color:var(--text-3); font:11px/1.5 var(--mono); margin-top:2px; word-break:break-all}
+.lact{display:flex; align-items:center; gap:6px; flex:0 0 auto}
+.badge2{font:600 10.5px/1.4 var(--sans); color:var(--text-3); background:var(--bg-sunken);
+  border:1px solid var(--border-2); border-radius:999px; padding:2px 7px}
+.badge2.ok{color:var(--ok); border-color:var(--ok)}
+.btn.xs{font-weight:500; padding:4px 9px; font-size:12px; border-radius:7px}
+
+/* 开关：语义上是 switch，用按钮自绘——原生 checkbox 各平台长得都不一样 */
+.sw{position:relative; width:38px; height:22px; flex:0 0 auto; border-radius:999px; cursor:pointer;
+  border:1px solid var(--border-3); background:var(--bg-sunken); padding:0; transition:.15s}
+.sw .knob{position:absolute; top:2px; left:2px; width:16px; height:16px; border-radius:50%;
+  background:var(--text-3); transition:.15s}
+.sw.on{background:var(--accent); border-color:var(--accent)}
+.sw.on .knob{left:18px; background:#fff}
+@media (prefers-reduced-motion:reduce){.sw,.sw .knob{transition:none}}
+
+.chips{display:flex; gap:6px}
+.chip{border:1px solid var(--border-2); background:transparent; color:var(--text-2); cursor:pointer;
+  border-radius:999px; padding:4px 11px; font:500 12px/1.4 var(--sans)}
+.chip:hover{background:var(--hover)}
+.chip.on{background:var(--accent); border-color:var(--accent); color:#fff}
+.chip.xs{font-weight:600; padding:3px 8px; font-size:11.5px; font-family:var(--mono)}
+
+.subtabs{display:flex; gap:6px; margin-bottom:12px}
+.subtab{border:1px solid transparent; background:var(--bg-sunken); color:var(--text-2); cursor:pointer;
+  border-radius:8px; padding:6px 14px; font:500 12.5px/1.4 var(--sans)}
+.subtab:hover{background:var(--hover)}
+.subtab.on{background:var(--accent); color:#fff}
+
+.set-form{display:flex; flex-direction:column; gap:10px; padding:2px 0 6px}
+/* align-items:flex-end —— 里面的输入框上方顶着一行标注（.fld），比按钮高一截；
+   按中线对齐会让按钮浮在半空，按底边对齐两者的底线才是齐的。 */
+.set-form.inline{flex-direction:row; align-items:flex-end; gap:8px; flex:0 0 auto; padding:0}
+/* 带标注的输入框：标注在上、框在下。父级 .set-form label 是横排的，这里覆写成竖排。 */
+.set-form label.fld{flex-direction:column; align-items:stretch; gap:5px}
+.set-form label.fld > .ipt{flex:0 0 auto}
+.fld > .cap{font:600 11.5px/1.4 var(--sans); color:var(--text-3); letter-spacing:.02em}
+/* 算式里的 × 和 = ：底边对齐之后要补一点下内边距，才落在输入框的中线上 */
+.set-form .op{font:600 13px/1.5 var(--sans); color:var(--text-3);
+  padding-bottom:8px; white-space:nowrap}
+.set-form .op b{font-family:var(--mono); font-weight:700; font-size:13.5px; color:var(--accent)}
+.set-form .op .why{font-weight:500; font-size:12px; color:var(--text-3)}
+.set-form .op.bad{color:var(--danger)}
+.set-form label{display:flex; align-items:center; gap:12px; font:500 13px/1.5 var(--sans);
+  color:var(--text-2)}
+.set-form label > .ipt,.set-form label > .pill{flex:1; min-width:0}
+.ipt{font-weight:500; border:1px solid var(--border-2); background:var(--bg-base); color:var(--text);
+  border-radius:8px; padding:7px 11px; font:13px/1.5 var(--sans); outline:none}
+.ipt:focus{border-color:var(--accent)}
+.ipt.sm{font-weight:500; width:96px; flex:0 0 auto; font-family:var(--mono); font-size:12.5px}
+.pill.wide{max-width:none}
+.set-note{font-weight:500; color:var(--text-3); font-size:12px; line-height:1.6}
+.set-note.dim{padding:14px 0 4px; border-top:1px solid var(--border-1); margin-top:8px}
+.set-note code,.toolgrid code{font-family:var(--mono); font-size:11.5px; background:var(--bg-sunken);
+  border:1px solid var(--border-1); border-radius:4px; padding:1px 4px}
+.set-note a{color:var(--accent); text-decoration:none}
+.set-note a:hover{text-decoration:underline}
+
+/* 审批弹窗里那句"点了会记住什么"。code 换行不折断，长路径靠容器滚。 */
+.permhint{font-size:12.5px; font-weight:500; line-height:1.7; color:var(--text-2);
+  background:var(--bg-sunken); border:1px solid var(--border-1); border-radius:9px;
+  padding:9px 12px}
+.permhint code, .modal .row code{font-family:var(--mono); font-size:.92em;
+  background:var(--bg-base); border:1px solid var(--border-2); border-radius:5px;
+  padding:1px 5px; word-break:break-all}
+
+/* 提示条：hint 是面板自带的静态说明，msg 是操作后的即时反馈 */
+.set-hint{font-weight:500; border-radius:8px; padding:9px 12px; font-size:12.5px; line-height:1.6;
+  background:var(--bg-sunken); color:var(--text-2); border:1px solid var(--border-1)}
+.set-hint.warn{color:var(--warn); border-color:color-mix(in srgb,var(--warn) 35%,transparent)}
+.set-hint.bad{color:var(--danger); border-color:color-mix(in srgb,var(--danger) 35%,transparent)}
+.set-msg{font-weight:500; min-height:20px; padding:10px 0 2px; font-size:12.5px; color:var(--text-2)}
+.set-msg.ok{color:var(--ok)} .set-msg.bad{color:var(--danger)} .set-msg.warn{color:var(--warn)}
+
+.set-imp{font-weight:500; margin-top:10px; padding:9px 12px; border-radius:8px; cursor:pointer; font-size:12.5px;
+  color:var(--warn); background:color-mix(in srgb,var(--warn) 12%,transparent);
+  border:1px solid color-mix(in srgb,var(--warn) 30%,transparent)}
+.set-imp:hover{background:color-mix(in srgb,var(--warn) 20%,transparent)}
+
+.toolgrid{display:flex; flex-wrap:wrap; gap:6px}
+/* 状态红点：靠 margin-left:auto 顶到按钮最右，不占位、不推挤文字 */
+.dot{margin-left:auto; width:7px; height:7px; border-radius:50%; background:var(--danger);
+  flex:0 0 auto}
+kbd{font:600 11px/1.6 var(--mono); color:var(--text-2); background:var(--bg-sunken);
+  border:1px solid var(--border-2); border-bottom-width:2px; border-radius:6px; padding:2px 7px;
+  white-space:nowrap; flex:0 0 auto}
+/* 大段原文（system prompt）：自己滚，别把弹窗撑到屏幕外 */
+.dump{margin:0; padding:12px 14px; background:var(--bg-sunken); border:1px solid var(--border-1);
+  border-radius:10px; font:12px/1.65 var(--mono); white-space:pre-wrap; word-break:break-word;
+  max-height:340px; overflow:auto; color:var(--text-2)}
+
+/* ---- 输入区：控件做进框内那一行 ---- */
+footer{flex:0 0 auto; padding:8px 22px 14px}
+.composer{max-width:calc(var(--col) + 32px); margin:0 auto; position:relative;
+  border:1px solid var(--border-2); border-radius:var(--radius);
+  background:var(--bg-layer); box-shadow:var(--shadow); padding:12px 14px 10px}
+/* 量高度用的离屏镜像：和 textarea 同字体同折行规则，左右贴边所以宽度自动一致。
+   绝对定位 = 不在文档流里，改它不会弄脏可见布局；这正是它存在的全部意义。 */
+#ta-mirror{position:absolute; left:14px; right:14px; top:12px; visibility:hidden;
+  pointer-events:none; z-index:-1; height:auto; max-height:none; overflow:hidden;
+  white-space:pre-wrap; word-break:break-word; contain:layout paint style}
+.composer:focus-within{border-color:var(--border-3)}
+/* 滚动条藏掉（同 .rail-body）：草稿写长了要滚，但打字时光标会自己把视野带过去，
+   不需要一条滚动条来指路。仍可滚，只是不画。 */
+textarea{width:100%; border:0; outline:0; resize:none; background:transparent; color:var(--text);
+  font:15px/1.7 var(--sans); max-height:200px; min-height:26px; padding:0;
+  scrollbar-width:none; -ms-overflow-style:none}
+textarea::-webkit-scrollbar{width:0; height:0}
+textarea::placeholder{color:var(--text-3)}
+.crow{display:flex; align-items:center; gap:8px; margin-top:10px}
+.cchip{border:0; background:transparent; color:var(--text-2); cursor:pointer;
+  border-radius:8px; padding:5px 9px; font:500 12.5px/1.4 var(--sans);
+  display:flex; align-items:center; gap:6px; white-space:nowrap}
+.cchip:hover{background:var(--hover); color:var(--text)}
+/* 模式胶囊的下拉箭头：自绘 chevron 转 90° 朝下（.cchip svg 那条会把尺寸统一定成 15px，
+   这里要比图标小一圈，所以单独压到 11px） */
+.cchip .car{color:var(--text-2); display:grid; place-items:center; transform:rotate(90deg)}
+.cchip .car svg{width:11px; height:11px}
+.cchip svg{width:15px; height:15px; display:block}
+.crow .right{margin-left:auto; display:flex; align-items:center; gap:8px}
+/* 发送/停止：圆形实心底 + SVG 图标。
+   【不用文字字形】——↑ ■ 这类字符的笔画粗细由字体决定，在实心圆里又细又小、还随系统
+   字体变；SVG 能把 stroke-width 和尺寸钉死，各平台一致。 */
+.circle{width:34px; height:34px; border:0; border-radius:50%; cursor:pointer;
+  background:var(--accent); color:#fff; display:grid; place-items:center; padding:0}
+.circle svg{width:19px; height:19px; display:block}
+.circle:hover{filter:brightness(1.08)}
+.circle:active{transform:scale(.94)}
+.circle.stop{background:var(--danger)}
+.circle.stop svg{width:19px; height:19px}
+@media (prefers-reduced-motion:reduce){.circle:active{transform:none}}
+.statline{font-weight:600; max-width:calc(var(--col) + 32px); margin:9px auto 0; color:var(--text-3);
+  font-size:11.5px; display:flex; gap:10px; flex-wrap:wrap; justify-content:center;
+  font-variant-numeric:tabular-nums}
+.statline b{font-weight:700; color:var(--text-2)}
+.statline .sep{opacity:.35}
+/* 压缩进度环。放在输入框那一行、模型名左边——它是"还能聊多久"的即时信号，
+   跟模式/模型一样属于随时要瞄一眼的东西，压在最底下的统计行里反而不容易注意到。
+   量的是【离压缩还有多远】而不是【离上限还有多远】：上限那个数用户其实碰不到，
+   压缩先发生；环满 = 下一轮就会压。点它可以手动压一次。
+   环形靠 stroke-dasharray/dashoffset 画弧：整圈周长 2πr，剩余的部分用 offset 顶掉。 */
+.ring{display:flex; align-items:center; gap:7px; padding:5px 9px; color:var(--text-3);
+  font:500 11.5px/1.4 var(--mono); font-variant-numeric:tabular-nums; white-space:nowrap;
+  border:0; background:transparent; border-radius:8px; cursor:pointer}
+.ring:hover{background:var(--hover); color:var(--text-2)}
+.ring svg{width:19px; height:19px; flex:0 0 auto; transform:rotate(-90deg)}  /* 从 12 点开始走 */
+.ring .trk{fill:none; stroke:var(--border-2); stroke-width:3}
+.ring .val{fill:none; stroke:var(--accent); stroke-width:3; stroke-linecap:round;
+  transition:stroke-dashoffset .3s}
+.ring.warn .val{stroke:var(--warn)} .ring.hot .val{stroke:var(--danger)}
+.ring.hot{color:var(--danger)}
+@media (prefers-reduced-motion:reduce){.ring .val{transition:none}}
+
+/* ================= 弹窗 ================= */
+.mask{position:fixed; inset:0; background:rgba(0,0,0,.4);
+  display:flex; align-items:center; justify-content:center; padding:24px; z-index:20}
+.modal{background:var(--bg-overlay); border:1px solid var(--border-2); border-radius:var(--radius);
+  box-shadow:var(--shadow); width:min(560px,100%); padding:20px;
+  display:flex; flex-direction:column; gap:14px; max-height:86vh; overflow-y:auto}
+.modal h2{margin:0; font:650 15px/1.4 var(--sans)}
+.modal pre{margin:0; padding:12px; background:var(--bg-sunken); border:1px solid var(--border-1);
+  border-radius:var(--radius-sm); font:12.5px/1.6 var(--mono);
+  overflow:auto; max-height:46vh; white-space:pre-wrap}
+.row{display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap}
+.btn{border:1px solid var(--border-2); background:transparent; color:var(--text);
+  border-radius:var(--radius-sm); padding:8px 14px; cursor:pointer; font:600 13px/1.4 var(--sans)}
+.btn:hover{background:var(--hover)}
+.btn.primary{background:var(--accent); border-color:var(--accent); color:#fff}
+.btn.danger{color:var(--danger)}
+
+/* 设置：左导航 + 行式布局（标签+说明在左、控件在右） */
+.set-head{display:flex; align-items:center; padding:16px 20px 8px; gap:10px}
+.set-head h2{flex:1}
+.set-body{display:flex}
+.set-nav{flex:0 0 168px; padding:0 10px 18px 14px; display:flex; flex-direction:column; gap:2px}
+.set-nav button{border:0; background:transparent; color:var(--text-2); text-align:left;
+  padding:9px 11px; border-radius:8px; cursor:pointer; font:500 13px/1.4 var(--sans)}
+.set-nav button:hover{background:var(--hover)}
+.set-nav button.on{background:var(--active); color:var(--text)}
+.set-main{flex:1; padding:0 20px 20px; overflow-y:auto}
+.set-row{display:flex; align-items:center; gap:20px; padding:16px 0; border-bottom:1px solid var(--border-1)}
+.set-row:last-child{border-bottom:0}
+.set-row .lab{flex:1}
+.set-row .lab .t{font-weight:600; font-size:13.5px}
+.set-row .lab .d{font-weight:500; color:var(--text-3); font-size:12.5px; margin-top:3px}
+/* 分段控件：三选一挤在一行里，和别的设置项一样"说明在左、控件在右"。
+   原来是三张通栏大卡片，光一个主题开关就占掉小半屏。 */
+.seg{display:flex; gap:2px; flex:0 0 auto; padding:3px;
+  background:var(--bg-sunken); border:1px solid var(--border-1); border-radius:10px}
+.segb{display:flex; align-items:center; gap:6px; cursor:pointer; white-space:nowrap;
+  border:0; background:transparent; color:var(--text-2);
+  border-radius:8px; padding:6px 10px; font:600 12.5px/1.4 var(--sans)}
+.segb:hover{background:var(--hover); color:var(--text)}
+.segb.on{background:var(--bg-layer); color:var(--accent); box-shadow:0 1px 2px rgba(0,0,0,.10)}
+.segb svg{width:15px; height:15px; flex:0 0 auto}
+/* 自定义下拉，取代原生 select 元素。
+   原生的选项列表由操作系统绘制：背景色、圆角、字重、行距一概不吃 CSS，
+   在这套深浅色主题里就是一块突兀的灰底方块。换成按钮 + .pop 浮层，
+   和标题栏那个模式选择器共用同一套视觉。 */
+.sel{position:relative; display:flex; min-width:0}
+.set-row > .sel{flex:0 0 auto; min-width:196px}
+.selbtn{flex:1; min-width:0; display:flex; align-items:center; gap:8px; cursor:pointer;
+  border:1px solid var(--border-2); background:var(--bg-layer); color:var(--text);
+  border-radius:8px; padding:7px 10px; font:600 13px/1.5 var(--sans); outline:0; text-align:left}
+.selbtn:hover{background:var(--hover); border-color:var(--border-3)}
+.selbtn:focus-visible{border-color:var(--accent)}
+.selbtn .selv{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.selbtn svg{width:15px; height:15px; flex:0 0 auto; color:var(--text-3)}
+
+/* 下拉浮层里的一行：名字 + 补充说明 + 选中勾。和 .mode-opt 同一套，只是不带图标。 */
+.pop-opt{display:flex; align-items:center; gap:10px; padding:8px 11px;
+  border-radius:9px; cursor:pointer}
+.pop-opt:hover{background:var(--hover)}
+.pop-opt.on{background:var(--accent-soft)}
+.pop-opt > .x{flex:1; min-width:0}
+.pop-opt .pt{font-weight:600; font-size:13.5px}
+.pop-opt .pd{font-weight:500; color:var(--text-3); font-size:12.5px; margin-top:2px;
+  overflow-wrap:anywhere}
+.pop-opt.on .pt{color:var(--accent)}
+/* 勾始终占位（只改透明度），否则选中项的文字会比别的行窄一截、跳来跳去 */
+.pop-opt .ck{width:16px; height:16px; flex:0 0 auto; color:var(--accent); opacity:0}
+.pop-opt.on .ck{opacity:1}
+
+/* 锚定浮层：贴着触发它的按钮弹，不用居中模态。
+   模式切换是个轻动作，拿全屏遮罩打断视线不合适；浮层还能保持"从哪来"的空间感。 */
+/* --anchor-w 由 popover() 按触发控件的宽度写入：下拉列表至少要和控件一样宽，
+   但也不能比 300px 还窄（选项带一行说明，太窄就折成好几行）。max() 把两条一起管了。 */
+.pop{position:fixed; z-index:30; background:var(--bg-overlay);
+  border:1px solid var(--border-2); border-radius:12px; box-shadow:var(--shadow);
+  padding:6px; min-width:max(300px, var(--anchor-w, 0px)); display:flex;
+  flex-direction:column; gap:2px}
+
+/* 模式选择：一行一个，图标 + 名字 + 说明，选中高亮 */
+.mode-opt{display:flex; align-items:center; gap:11px; padding:9px 11px;
+  border:1px solid transparent; border-radius:9px; cursor:pointer}
+.mode-opt:hover{background:var(--hover)}
+.mode-opt.on{background:var(--accent-soft)}
+.mode-opt svg{width:19px; height:19px; flex:0 0 auto; color:var(--text-3)}
+.mode-opt.on svg, .mode-opt.on .mt{color:var(--accent)}
+.mode-opt .mt{font-weight:600; font-size:13.5px}
+.mode-opt .md{font-weight:500; color:var(--text-3); font-size:12.5px; margin-top:2px}
+
+/* 计划待批准：非模态条，压在输入框上方——先让人读完再批，不打断阅读 */
+.planbar{max-width:calc(var(--col) + 32px); margin:0 auto 10px;
+  border:1px solid var(--accent); background:var(--accent-soft); border-radius:12px;
+  padding:11px 14px; display:flex; align-items:center; gap:10px}
+.planbar .pt{flex:1; font-size:13.5px; font-weight:600; color:var(--accent)}
+
+/* 提问 */
+.q{display:flex; flex-direction:column; gap:8px}
+.q .head{font:600 11px/1.4 var(--sans); letter-spacing:.05em; text-transform:uppercase; color:var(--text-3)}
+.q .title2{font-weight:600}
+.opt{font-weight:500; border:1px solid var(--border-2); border-radius:var(--radius-sm); padding:9px 12px;
+  cursor:pointer; font-size:13.5px}
+.opt:hover{background:var(--hover)}
+.opt.sel{border-color:var(--accent); background:var(--accent-soft); color:var(--accent)}
+.opt .desc{font-weight:500; color:var(--text-3); font-size:12px; margin-top:3px}
+.opt.sel .desc{color:inherit; opacity:.8}
+.q input[type=text]{font-weight:500; border:1px solid var(--border-2); border-radius:var(--radius-sm);
+  padding:9px 12px; font:13.5px var(--sans); background:transparent; color:var(--text); outline:0}
+.q input[type=text]:focus{border-color:var(--accent)}
+
+/* 键盘焦点圈。【故意不含 textarea】：文本框自己有闪动的光标，那就是焦点指示，
+   再套一圈蓝边是重复的。按钮这一串必须留着——它们没有光标，这圈描边是键盘走界面时
+   唯一能看出焦点在哪的东西。 */
+.btn:focus-visible,.more:focus-visible,.item:focus-visible,
+.opt:focus-visible,.mini:focus-visible,.cchip:focus-visible,.circle:focus-visible,
+.segb:focus-visible,.icon:focus-visible,.newbtn:focus-visible,.foot-btn:focus-visible{
+  outline:2px solid var(--accent); outline-offset:2px}
+/* 窄屏：左栏浮起来盖在内容上；右栏直接收掉（挤不下两栏）。
+   选择器必须写 #rail 而不是 aside——右栏也是 aside，会被一起拽到屏幕左边。 */
+@media (max-width:920px){
+  #rail{position:fixed; left:0; top:0; bottom:0; z-index:9; box-shadow:var(--shadow)}
+  #side{display:none}
+}
+</style>
+<script src="markdown.js"></script>
+</head>
+<body>
+
+<aside id="rail">
+  <div class="rail-top">
+    <span class="logo"><img class="mark" src="icon.svg" width="22" height="22" alt=""><span class="wm">me<b>code</b></span></span>
+    <button class="icon" id="rail-hide" title="收起侧栏" aria-label="收起侧栏"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="4"/><path d="M9.3 4.5v15"/></svg></button>
+  </div>
+  <button class="newbtn" id="new"><span class="ig"></span>新会话</button>
+  <div class="rail-body">
+    <div class="sec"><h3>工作区
+      <button class="lnk" id="arch-toggle" hidden></button>
+      <button class="lnk ico" id="ws-add" title="选择一个文件夹作为新工作区"
+        aria-label="新工作区"></button>
+      <span class="count" id="n-sess">0</span></h3><div id="sessions"></div></div>
+  </div>
+  <div class="grip" id="grip" title="拖动调宽（双击复位）" role="separator"
+       aria-orientation="vertical" aria-label="调整侧栏宽度"></div>
+  <div class="rail-foot"><button class="foot-btn" id="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.1"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>设置<span class="dot" id="mcp-bad" hidden></span></button></div>
+</aside>
+
+<div class="stage-area">
+  <div class="topbar" id="topbar" hidden>
+    <button class="icon" id="rail-show" title="展开侧栏" aria-label="展开侧栏" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><rect x="3" y="4.5" width="18" height="15" rx="4"/><path d="M9.3 4.5v15"/></svg></button>
+    <span class="runner" id="runner" hidden aria-hidden="true"><i></i><i></i><i></i></span>
+    <span class="title" id="title"></span>
+    <span class="right"><span class="tag conn" id="conn"><span class="cpip"></span>连接中</span></span>
+  </div>
+
+  <div class="hero" id="hero">
+    <h1><img class="mark lg" src="icon.svg" width="40" height="40" alt=""><span class="wm">me<span style="color:var(--accent)">code</span></span><span class="badge">本地</span></h1>
+    <div class="sub">跑在这台机器上的编程 agent</div>
+  </div>
+
+  <main id="main" hidden><div class="col" id="col"></div></main>
+
+  <footer>
+    <div class="planbar" id="planbar" hidden>
+      <span class="pt">计划已提交，待你批准</span>
+      <button class="btn" id="plan-view">查看计划</button>
+      <button class="btn primary" id="plan-ok">批准执行</button>
+    </div>
+    <!-- 后台任务条：贴在输入框上方。空的时候整条收起，不留占位。 -->
+    <div class="bgbar" id="bgbar" hidden></div>
+    <div class="composer">
+      <textarea id="input" rows="1" placeholder="给 agent 发消息…  (Enter 发送 / Shift+Enter 换行)"></textarea>
+      <div class="crow">
+        <button class="cchip" id="mode" title="权限模式"><span id="mode-ico"></span><span id="mode-txt">—</span> <span class="car"></span></button>
+        <span class="right">
+          <button class="ring" id="ring" hidden><svg viewBox="0 0 24 24"><circle class="trk"
+            cx="12" cy="12" r="9"/><circle class="val" cx="12" cy="12" r="9"/></svg><span
+            id="ring-txt"></span></button>
+          <button class="cchip" id="model" title="模型 / 设置">—</button>
+          <button class="circle" id="send" title="发送" aria-label="发送"><svg viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round"
+            stroke-linejoin="round"><path d="M12 20V5"/><path d="M5.5 11.5 12 5l6.5 6.5"/></svg></button>
+          <button class="circle stop" id="stop" title="停止" aria-label="停止" hidden><svg
+            viewBox="0 0 24 24" fill="currentColor"><rect x="4.5" y="4.5" width="15" height="15"
+            rx="3.6"/></svg></button>
+        </span>
+      </div>
+    </div>
+    <div class="statline" id="stat"></div>
+  </footer>
+</div>
+
+<!-- 右栏：任务清单 + 工作流。两块都空时整条收起（见 syncSide）。 -->
+<aside id="side" hidden>
+  <div class="sec" id="sec-tasks"><h3>任务清单 <span class="count" id="n-tasks">0</span></h3>
+    <div id="tasks"></div></div>
+  <div class="sec" id="sec-wf"><h3>工作流 <span class="count" id="n-wf">0</span></h3>
+    <div id="wf"></div></div>
+</aside>
+
+<script>
+// ---- 主题：跟随系统 / 亮 / 暗 ----
+// 跟随系统时【必须摘掉 data-theme 属性】，写死任何值都会让系统切换失灵。
+// 图标自绘，不用 ☀ ☾ 🖥 这类字符：它们的粗细、大小、基线全由系统字体决定，
+// 🖥 在 Windows 上还会被渲成彩色 emoji，和旁边两个单色符号完全不是一套东西。
+const THEMES = [
+  {k:'light', t:'浅色',
+   svg:'<circle cx="12" cy="12" r="4.2"/><path d="M12 2.7v2.1M12 19.2v2.1M4.4 4.4l1.5 1.5'
+       + 'M18.1 18.1l1.5 1.5M2.7 12h2.1M19.2 12h2.1M4.4 19.6l1.5-1.5M18.1 5.9l1.5-1.5"/>'},
+  {k:'dark', t:'深色',
+   svg:'<path d="M20.4 14.2A8.6 8.6 0 0 1 9.8 3.6 8.6 8.6 0 1 0 20.4 14.2Z"/>'},
+  {k:'system', t:'跟随系统',
+   svg:'<rect x="2.8" y="4.3" width="18.4" height="12.4" rx="2.2"/><path d="M8.6 20.5h6.8M12 16.7v3.8"/>'},
+];
+const themeIcon = k => {
+  const t = THEMES.find(x => x.k === k) || THEMES[0];
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+    stroke-linecap="round" stroke-linejoin="round">${t.svg}</svg>`;
+};
+function applyTheme(k){
+  const r = document.documentElement;
+  if (k === 'system') r.removeAttribute('data-theme'); else r.setAttribute('data-theme', k);
+  try { localStorage.setItem('mecode-theme', k); } catch (e) {}
+  // 选中态由设置面板的 markTheme() 负责（那边按 data-act="theme" 找）。
+  // 这里曾经按 data-theme-card 也标一遍，但那个属性早随卡片改版一起没了——留着只是死代码。
+}
+let themeKey = 'system';
+try { themeKey = localStorage.getItem('mecode-theme') || 'system'; } catch (e) {}
+applyTheme(themeKey);          // 首屏就定，避免闪一下错主题
+
+// ---- 四个权限模式 ----
+// 图标按【权限松紧】排：盾牌(每次问) → 盾牌带勾(项目内放行) → 放大镜(只读探索) → 闪电(全放行)。
+// 形状本身就表达状态，不用读字也能看出当前有多松。
+const MODES = [
+  {k:'normal', t:'标准', d:'需要审核的改动和命令，每次都问你',
+   svg:'<path d="M12 3 4 6v6c0 5 3.4 8.4 8 9 4.6-.6 8-4 8-9V6l-8-3Z"/>'},
+  {k:'auto', t:'自动', d:'改动项目内的文件自动放行；其他工具仍会问',
+   svg:'<path d="M12 3 4 6v6c0 5 3.4 8.4 8 9 4.6-.6 8-4 8-9V6l-8-3Z"/><path d="m9 12 2 2 4-4"/>'},
+  {k:'plan', t:'计划', d:'只读探索、先给出完整计划，你批准后才动手',
+   svg:'<circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/>'},
+  {k:'yolo', t:'完全', d:'所有工具自动放行、不再询问（慎用）',
+   svg:'<path d="M13 2 4.5 13.5H11l-1 8.5 8.5-11.5H12l1-8.5Z"/>'},
+];
+const modeIcon = k => {
+  const m = MODES.find(x => x.k === k) || MODES[0];
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"
+    stroke-linecap="round" stroke-linejoin="round">${m.svg}</svg>`;
+};
+
+// token 由服务端注入 index.html；同源策略保证别的站点读不到。URL 参数是兜底。
+const TOKEN = (window.__MECODE__ && window.__MECODE__.token)
+  || new URLSearchParams(location.search).get('token') || '';
+
+const $ = id => document.getElementById(id);
+const col = $('col');
+// 引号也转义：esc 的结果有多处直接进属性（title="..." / data-x="..."），
+// 不转义的话一个引号就能提前闭合属性、注入别的属性。
+const ESC = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ESC[c]);
+
+/* 界面上的小图标一律自绘。用 ✚ → ▾ ⧉ 这类字符的话，粗细/大小/基线全看系统字体，
+   改 font-weight 往往毫无效果，换台机器还长得不一样。 */
+const SVG = (d, w) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+  stroke-width="${w || 2.2}" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
+const IC = {
+  chev: SVG('<path d="m9 5.5 7 6.5-7 6.5"/>', 2.6),          // 折叠/展开
+  arrow: SVG('<path d="M4.5 12h14"/><path d="m12.5 6 6 6-6 6"/>', 2.4),   // 切到这个工作区
+  plus: SVG('<path d="M12 5v14"/><path d="M5 12h14"/>', 2.4),
+  copy: SVG('<rect x="9" y="9" width="11" height="11" rx="2.4"/>'
+          + '<path d="M5.5 15H5a1.5 1.5 0 0 1-1.5-1.5V5A1.5 1.5 0 0 1 5 3.5h8.5A1.5 1.5 0 0 1 15 5v.5"/>', 1.9),
+};
+
+const api = (p, b) => fetch(p, {method:'POST',
+  headers:{'Content-Type':'application/json','X-Mecode-Token':TOKEN},
+  body:JSON.stringify(b || {})}).then(r => r.json()).catch(() => ({error:'请求失败'}));
+const get = p => fetch(p, {headers:{'X-Mecode-Token':TOKEN}})
+  .then(r => r.json()).catch(() => ({error:'请求失败'}));
+
+let busy = false, live = null, liveKind = null, curSession = '';
+let histBefore = 0, histTotal = 0, ctxLimit = 0, ctxUsed = 0, compactAt = 0;
+
+/* 本地已经乐观渲染、还等着对应 SSE 事件来认领的用户消息。
+   【必须是队列，不能是单个变量】：忙时连发两条，第二条会把第一条的记号覆盖掉，
+   等第一条的事件回来时认领不到，于是又渲一遍——"a b" 发完看到的是 "a b a"。
+   按内容找、找到就摘掉一个，重复内容也各认各的。 */
+let pendingEcho = [];
+const claimEcho = text => {
+  const i = pendingEcho.indexOf(text);
+  if (i < 0) return false;
+  pendingEcho.splice(i, 1);
+  return true;
+};
+let turns = 0, toolCalls = 0, lastUsage = null;
+const toolBox = new Map();
+
+const atBottom = () => { const m=$('main'); return m.scrollHeight-m.scrollTop-m.clientHeight < 90; };
+const scroll = () => { const m=$('main'); m.scrollTop = m.scrollHeight; };
+
+/** 有内容就从 hero 切到对话视图。hero 是"还没开始"，不是一个空的对话列表。 */
+function enterChat(){
+  if (!$('main').hidden) return;
+  $('hero').hidden = true; $('main').hidden = false; $('topbar').hidden = false;
+}
+
+function msg(role, cls){
+  enterChat();
+  const d = document.createElement('div');
+  d.className = 'msg ' + role + (cls ? ' ' + cls : '');
+  col.appendChild(d);
+  return d;
+}
+
+function copyBtn(getText){
+  const b = document.createElement('button');
+  b.className = 'act'; b.title = '复制'; b.setAttribute('aria-label', '复制');
+  b.innerHTML = IC.copy;
+  b.onclick = () => navigator.clipboard && navigator.clipboard.writeText(getText());
+  return b;
+}
+
+function userBubble(text, queued){
+  const d = msg('user', queued ? 'queued' : '');
+  const b = document.createElement('div'); b.className = 'bubble'; b.textContent = text;
+  d.appendChild(b);
+  const acts = document.createElement('div'); acts.className = 'acts';
+  acts.appendChild(copyBtn(() => text));
+  d.appendChild(acts);
+  liveKind = null; scroll();
+  return d;
+}
+
+/** 流式文本/思考：同类连续片追加进同一节点，换类型才新建。
+    思考渲成一行折叠预览，展开才铺全文。 */
+/** 按 Markdown 重绘一个气泡。节点上挂着 _raw（原文）——渲染是有损的（标记吃掉了），
+    要复制/重渲都得回到原文，绝不能从 textContent 反推。
+
+    流式期间【节流】：每来一个 token 就整段重解析既贵又闪（"**粗" 还没闭合时会一跳一跳）。
+    默认攒够一帧再画，收尾（now=true）无条件画一次定稿。 */
+const MD_FRAME = 66;
+function paintMd(el, now){
+  if (now) { clearTimeout(el._mdT); el._mdT = 0; }
+  else {
+    const t = performance.now();
+    if (el._mdAt && t - el._mdAt < MD_FRAME) {          // 太密 → 推迟到帧尾，别丢
+      clearTimeout(el._mdT);
+      el._mdT = setTimeout(() => paintMd(el, true), MD_FRAME);
+      return;
+    }
+    el._mdAt = t;
+  }
+  const raw = el._raw || '';
+  // 没有任何标记的白话就别过一遍解析器：又快又不会把 "1. 2. 3." 这种误当列表
+  if (looksLikeMarkdown(raw)) { el.className = 'bubble md'; el.innerHTML = renderMarkdown(raw); }
+  else { el.className = 'bubble'; el.textContent = raw; }
+}
+
+function stream(kind, text){
+  const stick = atBottom();
+  if (liveKind !== kind) {
+    const d = msg('bot');
+    if (kind === 'text') {
+      live = document.createElement('div'); live.className = 'bubble'; d.appendChild(live);
+      live._raw = '';                                  // 有 _raw = 这个节点走 Markdown
+      // 【捕获这一个节点】而不是闭包引用全局的 live：live 每换一段流就被重新赋值，
+      // 直接引用它的话，翻上去点旧气泡的复制，复制到的是最后那一段。
+      const node = live;
+      const acts = document.createElement('div'); acts.className = 'acts';
+      acts.appendChild(copyBtn(() => node._raw));      // 复制给【原文】，不是渲染后的字
+      d.appendChild(acts);
+    } else {
+      const t = document.createElement('details'); t.className = 'think';
+      t.innerHTML = '<summary><span class="lbl">Think</span><span class="peek"></span></summary>'
+                  + '<div class="full"></div>';
+      d.appendChild(t);
+      live = t.querySelector('.full'); live._peek = t.querySelector('.peek');
+    }
+    liveKind = kind;
+  }
+  if (live._raw != null) { live._raw += text; paintMd(live); }
+  else {
+    live.textContent += text;                          // 思考：纯文本，不渲染
+    if (live._peek) live._peek.textContent = '· ' + live.textContent.slice(-160).replace(/\s+/g, ' ');
+  }
+  if (stick) scroll();
+}
+
+/* 工具图标：按【它干什么】分类，不是一个工具一个图，
+   28 个工具 28 张图既画不完也记不住；分成读/写/跑/查/网/记/任务这几类，扫一眼就够。 */
+const TI = {
+  read: '<path d="M6.5 3.2h6.6L18 8v12a1.8 1.8 0 0 1-1.8 1.8H6.5A1.8 1.8 0 0 1 4.7 20V5a1.8 1.8 0 0 1 1.8-1.8Z"/><path d="M13 3.4V8h4.6"/>',
+  write: '<path d="M5 19.5 4 21l1.5-1Z"/><path d="M13.6 4.6a2.2 2.2 0 0 1 3.1 3.1L7.9 16.5 4 17.5l1-3.9Z"/>',
+  run: '<path d="M4.6 4.5h14.8a1.8 1.8 0 0 1 1.8 1.8v11.4a1.8 1.8 0 0 1-1.8 1.8H4.6a1.8 1.8 0 0 1-1.8-1.8V6.3a1.8 1.8 0 0 1 1.8-1.8Z"/><path d="m7.5 9.8 2.6 2.4-2.6 2.4"/><path d="M12.8 14.8h4"/>',
+  find: '<circle cx="10.8" cy="10.8" r="6.2"/><path d="m15.4 15.4 4.3 4.3"/>',
+  net: '<circle cx="12" cy="12" r="8.4"/><path d="M3.7 12h16.6"/><path d="M12 3.6a13 13 0 0 1 0 16.8 13 13 0 0 1 0-16.8Z"/>',
+  mem: '<path d="M6.4 3.4h11.2a1.6 1.6 0 0 1 1.6 1.6v15.3l-7.2-4-7.2 4V5a1.6 1.6 0 0 1 1.6-1.6Z"/>',
+  task: '<path d="M9.4 6.5h10.2"/><path d="M9.4 12h10.2"/><path d="M9.4 17.5h10.2"/><path d="m3.6 6.3 1.3 1.3 2.2-2.3"/><path d="m3.6 11.8 1.3 1.3 2.2-2.3"/><path d="m3.6 17.3 1.3 1.3 2.2-2.3"/>',
+  bg: '<circle cx="12" cy="12" r="8.4"/><path d="M12 7.2V12l3.2 1.9"/>',
+  agent: '<circle cx="9" cy="8.4" r="3.2"/><path d="M3.4 19.6a5.9 5.9 0 0 1 11.2 0"/><path d="M16.5 5.6a3 3 0 0 1 0 5.7"/><path d="M18 19.6a5.4 5.4 0 0 0-2.6-4.5"/>',
+  flow: '<circle cx="6" cy="5.4" r="2.3"/><circle cx="6" cy="18.6" r="2.3"/><circle cx="18" cy="12" r="2.3"/><path d="M6 7.7v8.6"/><path d="M6 12h9.7"/>',
+  ask: '<path d="M20.4 12.6a7.6 7.6 0 0 1-8.2 7.6L5 21.4l1.2-5.5a7.6 7.6 0 1 1 14.2-3.3Z"/>',
+  plan: '<path d="M8.6 3.6h6.8a1.4 1.4 0 0 1 1.4 1.4v.7H7.2V5a1.4 1.4 0 0 1 1.4-1.4Z"/><path d="M17 5.7h1.8a1.6 1.6 0 0 1 1.6 1.6v12.5a1.6 1.6 0 0 1-1.6 1.6H5.2a1.6 1.6 0 0 1-1.6-1.6V7.3a1.6 1.6 0 0 1 1.6-1.6H7"/><path d="m8.8 14 2.1 2.1 4.3-4.3"/>',
+  tool: '<path d="M14.2 6.4a4.6 4.6 0 0 0 6 6l-8.5 8.5a2.6 2.6 0 0 1-3.7-3.7Z"/><circle cx="6.6" cy="6.6" r="2.8"/>',
+};
+/* 工具 → [图标, 配色类]。配色只分三档：写=琥珀（有副作用）、跑=蓝、联网=绿，其余中性。
+   MCP 工具（名字带 __）走兜底。 */
+const TOOL_KIND = {
+  read_file:['read',''], glob:['find',''], grep:['find',''],
+  write_file:['write','k-write'], edit_file:['write','k-write'],
+  bash:['run','k-run'], subagent:['agent','k-run'], run_workflow:['flow','k-run'],
+  web_search:['net','k-net'], web_fetch:['net','k-net'],
+  save_memory:['mem','k-write'], recall_memory:['mem',''],
+  task_create:['task',''], task_update:['task',''], task_get:['task',''], task_list:['task',''],
+  check_bgtask:['bg',''], wait_bgtask:['bg',''], kill_bgtask:['bg','k-write'],
+  ask_user:['ask',''], exit_plan:['plan',''],
+};
+const toolIcon = name => {
+  const k = (TOOL_KIND[name] || ['tool', ''])[0];
+  return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+    stroke-linecap="round" stroke-linejoin="round">${TI[k]}</svg>`;
+};
+const toolKindClass = name => (TOOL_KIND[name] || ['tool', ''])[1];
+
+/** 参数可能是对象，也可能是模型吐的 JSON 字符串（还可能是半截坏的）。一律安全解析。 */
+function toolArgs(a){
+  if (a && typeof a === 'object') return a;
+  try { return JSON.parse(a || '{}') || {}; } catch (e) { return {}; }
+}
+
+const cut = (v, n) => { const t = String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+                        return t.length > n ? t.slice(0, n) + '…' : t; };
+
+/** 标题行那句摘要，拆成 [主体, 限定语]：
+      主体   = 这次调用作用在【谁】身上（文件名/命令/模式），长度不定，放不下才省略
+      限定语 = 【怎么】作用（行范围/字数/后台），短且定长，贴右显示、永不省略
+    合成一串的话，省略号切掉的往往正是后半截那个定长信息——而它恰恰是放得下的。
+
+    认不出的工具（含 MCP）回落到"第一个参数的值"，比整坨 JSON 还是好读得多。
+
+    这里的字数上限【不是排版宽度】——真实可用宽度只有浏览器知道，
+    由 .arg 的 text-overflow:ellipsis 按实际宽度省略。这层只是护栏：
+    别把 10 万字的 content 整个塞进 DOM。所以定在"绝不会有人想看这么长"的量级。 */
+function toolBrief(name, o){
+  const n = v => Number(v) || 0;
+  switch (name) {
+    case 'read_file': {
+      const from = n(o.offset), lim = n(o.limit);
+      return [cut(o.path, 240),
+              from || lim ? `第 ${from + 1} 行起${lim ? `，共 ${lim} 行` : ''}` : ''];
+    }
+    case 'write_file': return [cut(o.path, 240), `写入 ${String(o.content || '').length} 字`];
+    case 'edit_file': return [cut(o.path, 240), o.replace_all ? '替换全部' : ''];
+    case 'bash': return [cut(o.command, 320), o.background ? '后台' : ''];
+    case 'grep': return [cut(o.pattern, 200) + (o.path ? `　在 ${cut(o.path, 240)}` : ''),
+                         o.output_mode && o.output_mode !== 'content' ? String(o.output_mode) : ''];
+    case 'glob': return [cut(o.pattern, 200) + (o.path ? `　在 ${cut(o.path, 240)}` : ''), ''];
+    case 'web_search': return [cut(o.query, 280), n(o.max_results) ? `${n(o.max_results)} 条` : ''];
+    case 'web_fetch': return [cut(o.url, 280), ''];
+    case 'exit_plan': return ['提交计划待批准', ''];
+    case 'task_list': return ['列出全部任务', ''];
+    case 'task_create': return [cut(o.subject, 240), ''];
+    case 'task_update': return [cut(o.task_id, 160), o.status ? `→ ${o.status}` : ''];
+    case 'task_get': return [cut(o.task_id, 160), ''];
+    case 'save_memory': return [cut(o.name, 200), cut(o.type, 24)];
+    case 'recall_memory': return [cut(o.name, 200), ''];
+    case 'check_bgtask': case 'wait_bgtask': case 'kill_bgtask':
+      return [`#${cut(o.id, 32)}`, o.seconds ? `等 ${n(o.seconds)} 秒` : ''];
+    case 'subagent': return [cut(o.description, 240), o.background ? '后台' : ''];
+    case 'run_workflow': {
+      const st = Array.isArray(o.stages) ? o.stages : [];
+      return [cut(st.map(x => x.description || x.id).join(' → '), 280), `${st.length} 个阶段`];
+    }
+    case 'ask_user': {
+      const q = Array.isArray(o.questions) ? o.questions : [];
+      return [cut(q.map(x => x.question).join(' / '), 240), `${q.length} 个问题`];
+    }
+    default: {
+      const k = Object.keys(o)[0];
+      return [k ? `${k}=${cut(o[k], 280)}` : '', ''];
+    }
+  }
+}
+
+/** 完整参数，缩进过的。原样是一长行，展开了也读不了。 */
+function toolFullArgs(args){
+  const o = toolArgs(args);
+  if (Object.keys(o).length) return JSON.stringify(o, null, 2);
+  return typeof args === 'string' ? args : JSON.stringify(args || {}, null, 2);
+}
+
+function toolNode(name, args){
+  const d = document.createElement('details');
+  d.className = 'tool ' + toolKindClass(name);
+  const brief = toolBrief(name, toolArgs(args));
+  d.innerHTML = `<summary>
+      <span class="ticon">${toolIcon(name)}</span>
+      <span class="name">${esc(name)}</span>
+      <span class="arg">${esc(brief[0])}</span>
+      ${brief[1] ? `<span class="argx">${esc(brief[1])}</span>` : ''}
+      <span class="spin"><span class="cpip"></span>运行中</span>
+      <span class="caret"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="m9 5.5 7 6.5-7 6.5"/></svg></span>
+    </summary>
+    <div class="tsec"><h5>参数</h5><pre class="targ">${esc(toolFullArgs(args))}</pre></div>
+    <div class="tsec"><h5>结果</h5><pre class="tout"></pre></div>`;
+  return d;
+}
+function toolStart(m){
+  const stick = atBottom();
+  const d = toolNode(m.name, m.args);
+  msg('bot').appendChild(d);
+  toolBox.set(m.id || m.name, d);
+  toolCalls++; renderStat(); liveKind = null;
+  if (stick) scroll();
+}
+function fillResult(d, m){
+  // 现在卡片里有两个 <pre>（参数、结果），必须按类选——querySelector('pre') 会命中参数那个
+  d.querySelector('.tout').textContent = m.result || '（无输出）';
+  const sp = d.querySelector('.spin'); if (sp) sp.remove();
+  if (m.full_path) {
+    const b = document.createElement('button');
+    b.className = 'more'; b.textContent = '看完整输出 →';
+    b.onclick = () => showBlob(m.full_path);
+    d.appendChild(b);
+  }
+}
+function toolResult(m){
+  const d = toolBox.get(m.id || m.name);
+  if (d) { fillResult(d, m); toolBox.delete(m.id || m.name); }
+  liveKind = null;
+}
+function notice(text, cls){
+  const d = msg('bot');
+  const n = document.createElement('div'); n.className = cls || 'notice'; n.textContent = text;
+  d.appendChild(n); liveKind = null; scroll();
+}
+
+// ---- 弹窗 ----
+function modal(html, onClick, cls){
+  const mask = document.createElement('div'); mask.className = 'mask';
+  mask.innerHTML = `<div class="modal ${cls || ''}" role="dialog" aria-modal="true">${html}</div>`;
+  mask.addEventListener('click', e => {
+    if (e.target === mask || e.target.dataset.close) return mask.remove();
+    if (onClick) onClick(e, mask);
+  });
+  document.body.appendChild(mask);
+  return mask;
+}
+function showText(title, body, footer){
+  return modal(`<h2>${esc(title)}</h2><pre>${esc(body)}</pre>
+    <div class="row">${footer || ''}<button class="btn primary" data-close="1">关闭</button></div>`);
+}
+/** 外置输出分页读：全文可达 50 万字符，一次整读会卡住这条连接。 */
+async function showBlob(path, offset = 0, prev = null, acc = ''){
+  const r = await get(`/api/tool_output?path=${encodeURIComponent(path)}&offset=${offset}`);
+  if (r.error) return showText('读不到', r.error);
+  const body = acc + r.chunk;
+  if (prev) prev.remove();
+  const m = showText('完整输出', body, r.eof ? ''
+    : `<button class="btn" data-next="1">再读 ${Math.min(r.total - body.length, 200000)} 字</button>`);
+  m.addEventListener('click', e => {
+    if (e.target.dataset.next) showBlob(path, offset + r.chunk.length, m, body);
+  });
+}
+
+// ---- 审批 / 提问 ----
+function askPermission(m){
+  // pattern 空 = 这次调用授权不了（含元字符的 bash、畸形参数、会逃出根的 glob）。
+  // 那就【不给"总是允许"】——点了要么无效、要么记下一条比本次调用更宽的规则。
+  const always = m.pattern
+    ? `<button class="btn" data-a="always" title="记住这条规则，以后不再问">
+         总是允许 <code>${esc(m.pattern)}</code></button>`
+    : '';
+  const mask = modal(`
+    <h2>${m.is_sub ? '子 agent' : 'mecode'} 想执行 <code>${esc(m.tool)}</code></h2>
+    <pre>${esc(JSON.stringify(m.args, null, 2))}</pre>
+    ${m.pattern ? `<div class="permhint">选「总是允许」会把
+      <code>${esc(m.pattern)}</code> 记进本项目的规则，以后同类调用不再问。</div>`
+      : '<div class="permhint">这次调用没法归纳成一条稳妥的规则，只能逐次允许。</div>'}
+    <div class="row">
+      <button class="btn danger" data-a="deny">拒绝</button>
+      ${always}
+      <button class="btn primary" data-a="once">允许一次</button>
+    </div>`, (e, mk) => {
+      const a = e.target.dataset.a;
+      if (!a) return;
+      api('/api/reply', {id:m.id, answer:a});
+      mk.remove();
+    });
+  mask.dataset.rid = m.id;
+  mask.querySelector('[data-a="once"]').focus();
+}
+/** 提问：每题一组选项（可多选）+ "其他"自由输入。答案形状要和 format_ask_result 对上。 */
+function askUser(m){
+  const qs = m.questions || [];
+  const html = qs.map((q, i) => `
+    <div class="q" data-qi="${i}">
+      ${q.header ? `<div class="head">${esc(q.header)}</div>` : ''}
+      <div class="title2">${esc(q.question)}</div>
+      ${(q.options || []).map((o, j) => `
+        <div class="opt" data-oi="${j}" tabindex="0"><span class="lbl">${esc(o.label)}</span>
+          ${o.description ? `<div class="desc">${esc(o.description)}</div>` : ''}</div>`).join('')}
+      <input type="text" placeholder="其他（自由填写）" data-other="1">
+    </div>`).join('');
+  const mask = modal(`<h2>mecode 想确认几件事</h2>${html}
+    <div class="row"><button class="btn" data-skip="1">跳过</button>
+    <button class="btn primary" data-ok="1">提交</button></div>`, (e, mk) => {
+      const opt = e.target.closest('.opt');
+      if (opt) {
+        const q = opt.closest('.q');
+        if (!qs[+q.dataset.qi].multi_select) q.querySelectorAll('.opt').forEach(x => x.classList.remove('sel'));
+        opt.classList.toggle('sel');
+        return;
+      }
+      if (e.target.dataset.skip) { api('/api/reply', {id:m.id, answer:null}); return mk.remove(); }
+      if (!e.target.dataset.ok) return;
+      const answers = {}, skipped = [];
+      mk.querySelectorAll('.q').forEach(q => {
+        const spec = qs[+q.dataset.qi];
+        const picked = [...q.querySelectorAll('.opt.sel .lbl')].map(x => x.textContent.trim());
+        const other = q.querySelector('[data-other]').value.trim();
+        if (other) picked.push('其他：' + other);
+        if (!picked.length) skipped.push(spec.question);
+        else answers[spec.question] = spec.multi_select ? picked : picked[0];
+      });
+      api('/api/reply', {id:m.id, answer:{answers, skipped}});
+      mk.remove();
+    });
+  mask.dataset.rid = m.id;
+}
+/** 服务端主动收窗（agent 被打断 / 换了会话）。不收的话前端留一张幽灵窗，
+    用户下次点击会被错配给下一个请求——最严重的是把"总是允许"落到别的工具名下。 */
+const dismiss = rid => document.querySelectorAll('.mask').forEach(
+  x => { if (x.dataset.rid === rid) x.remove(); });
+
+// ---- 设置：整块在 desktop/settings.js（五个面板，自成一块）----
+
+// ---- 侧栏 ----
+const since = ts => {
+  const s = Math.max(0, Math.floor(Date.now()/1000 - ts));
+  return s < 60 ? s + ' 秒' : s < 3600 ? Math.floor(s/60) + ' 分' : Math.floor(s/3600) + ' 小时';
+};
+/** "多久以前"。跨度大的用两级（3天5时前）——只说"3天前"看不出是刚过 3 天还是快 4 天了。 */
+function ago(ts){
+  const s = Math.max(0, Math.floor(Date.now()/1000 - (ts || 0)));
+  if (!ts) return '';
+  if (s < 60) return '刚刚';
+  if (s < 3600) return Math.floor(s/60) + ' 分钟前';
+  if (s < 86400) {
+    const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
+    return h + ' 小时' + (m ? ' ' + m + ' 分' : '') + '前';
+  }
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600);
+  if (d < 30) return d + ' 天' + (h ? ' ' + h + ' 时' : '') + '前';
+  return new Date(ts * 1000).toLocaleDateString();
+}
+
+const ICON = {
+  rename: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
+  fork: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="5" r="2.2"/><circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="12" r="2.2"/><path d="M6 7.2v9.6"/><path d="M6 12h9.8"/></svg>',
+  archive: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4.5" rx="1.5"/><path d="M5 8.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19V8.5"/><path d="M10 12.5h4"/></svg>',
+  // 三个圆点自己画，不用 ⋮ 字符：那个字的粗细和间距全看系统字体，
+  // Windows 上又细又挤，放大只是把糊的东西放得更大。
+  kebab: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5.2" r="1.85"/>'
+       + '<circle cx="12" cy="12" r="1.85"/><circle cx="12" cy="18.8" r="1.85"/></svg>',
+  unarchive: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4.5" rx="1.5"/><path d="M5 8.5V19a1.5 1.5 0 0 0 1.5 1.5h11A1.5 1.5 0 0 0 19 19V8.5"/><path d="M12 18v-5.5"/><path d="M9.5 15 12 12.5l2.5 2.5"/></svg>',
+};
+
+/** 模式键 → 中文名。走 MODES（模式名的唯一真相源），不另抄一份表——
+    抄一份的下场是加了新模式只改一处，另一处默默显示英文键。
+    认不出的键原样显示，至少不是空白。 */
+const modeName = k => (MODES.find(m => m.k === k) || {}).t || k || '';
+
+let showArchived = false;
+
+function renderSessions(list, archivedCount){
+  $('n-sess').textContent = list.length;
+  const tog = $('arch-toggle');
+  tog.hidden = !archivedCount && !showArchived;   // 一条归档都没有就别摆这个入口
+  tog.textContent = showArchived ? '← 返回' : `已归档 ${archivedCount}`;
+  tog.classList.toggle('on', showArchived);
+  $('sessions').innerHTML = list.slice(0, 30).map(sessionRow).join('')
+    || `<div class="empty">${showArchived ? '没有已归档的会话' : '暂无会话'}</div>`;
+}
+
+/** 一行会话。分组视图和归档视图共用——两份模板迟早长歪。 */
+const sessionRow = s => `
+  <div class="item ${s.current ? 'cur' : ''}" data-sid="${esc(s.id)}" tabindex="0">
+    <div class="t">${esc((s.title || '（无标题）').slice(0, 120))}</div>
+    <div class="sub">${s.tokens ? (s.tokens/1000).toFixed(1) + 'k' : '空'} · ${esc(modeName(s.mode))}
+      <span class="ago">${esc(ago(s.updated_at))}</span>
+      <button class="kebab" data-menu="${esc(s.id)}" title="更多" aria-label="更多操作">${ICON.kebab}</button>
+    </div>
+  </div>`;
+
+const FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"'
+  + ' stroke-linecap="round" stroke-linejoin="round"><path d="M3.4 6.6a1.8 1.8 0 0 1 1.8-1.8h3.6'
+  + 'l2 2.4h7.6a1.8 1.8 0 0 1 1.8 1.8v8.4a1.8 1.8 0 0 1-1.8 1.8H5.2a1.8 1.8 0 0 1-1.8-1.8Z"/></svg>';
+
+/* 折叠了哪些工作区。存 cwd 而不是下标——列表顺序会随活跃度变，存下标下次就对错人了。 */
+let wsFold = new Set();
+try { wsFold = new Set(JSON.parse(localStorage.getItem('mecode-ws-fold') || '[]')); } catch (e) {}
+const saveFold = () => {
+  try { localStorage.setItem('mecode-ws-fold', JSON.stringify([...wsFold])); } catch (e) {}
+};
+
+/** 侧栏按工作区分组。归档视图同样分组——不分的话几个项目的归档会话混成一张平表，
+    标题还常常长得一样，根本分不出哪条属于哪个项目。 */
+function renderWorkspaces(list, archivedTotal){
+  $('n-sess').textContent = list.reduce((a, w) => a + w.sessions.length, 0);
+  const tog = $('arch-toggle');
+  tog.hidden = !archivedTotal && !showArchived;
+  tog.textContent = showArchived ? '← 返回' : `已归档 ${archivedTotal}`;
+  tog.classList.toggle('on', showArchived);
+  $('sessions').innerHTML = list.map(w => {
+    const fold = wsFold.has(w.cwd);
+    return `
+    <div class="wsgrp ${w.current ? 'cur' : ''} ${fold ? 'fold' : ''}" data-ws="${esc(w.cwd)}"
+         title="${esc(w.cwd)}" tabindex="0" role="button" aria-expanded="${!fold}">
+      <span class="tw">${IC.chev}</span>${FOLDER}
+      <span class="nm">${esc(w.name || w.cwd)}</span>
+      <button class="go" data-go-ws="${esc(w.cwd)}" title="切到这个工作区"
+              aria-label="切到这个工作区">${IC.arrow}</button>
+      <span class="n">${w.sessions.length}</span>
+    </div>
+    <div class="wsbody" ${fold ? 'hidden' : ''}>${w.sessions.slice(0, 20).map(sessionRow).join('')
+      || '<div class="empty">还没有会话</div>'}</div>`;
+  }).join('') || `<div class="empty">${showArchived ? '没有已归档的会话' : '暂无工作区'}</div>`;
+}
+
+/** 刷新侧栏。两种视图都按工作区分组，只差一个查询参数。 */
+const reloadSessions = () =>
+  get('/api/workspaces' + (showArchived ? '?archived=1' : '')).then(r => {
+    const ws = r.workspaces || [];
+    // 归档总数从各组的 archived_count 累加（它不随视图变），别拿当前这份列表的长度算
+    renderWorkspaces(ws, ws.reduce((a, w) => a + (w.archived_count || 0), 0));
+    const cur = ws.flatMap(w => w.sessions).find(x => x.current);
+    if (cur && !showArchived) $('title').textContent = cur.title || '新会话';
+    return {sessions: ws.flatMap(w => w.sessions)};
+  });
+
+$('arch-toggle').onclick = e => { e.stopPropagation(); showArchived = !showArchived; reloadSessions(); };
+
+/** 会话行的三点菜单。归档视图里只给"取消归档"——在那儿改名/分叉没什么意义。 */
+function sessionMenu(btn, sid){
+  const item = btn.closest('.item');
+  const isCur = item.classList.contains('cur');
+  const html = showArchived
+    ? `<button class="mi" data-a="unarchive">${ICON.unarchive}取消归档</button>`
+    : `<button class="mi" data-a="rename">${ICON.rename}重命名</button>
+       <button class="mi" data-a="fork">${ICON.fork}分叉会话</button>
+       <button class="mi" data-a="archive">${ICON.archive}归档会话</button>`;
+  popover(btn, html, async (e, close) => {
+    const a = (e.target.closest('[data-a]') || {}).dataset;
+    if (!a) return;
+    close();
+    if (a.a === 'rename') return renameSession(sid, item.querySelector('.t').textContent.trim());
+    if (a.a === 'fork') {
+      const r = await api('/api/session/fork', {id: sid});
+      return r.error ? notice(r.error) : null;     // 成功会走 resumed 事件，界面自己会跟上
+    }
+    // 归档当前会话服务端会拒绝（拒绝理由直接显示给用户），这里不用自己判
+    const r = await api('/api/session/archive', {id: sid, archived: a.a === 'archive'});
+    if (r.error) return notice(r.error);
+    if (isCur) return;
+    reloadSessions();
+  });
+}
+
+function renameSession(sid, cur){
+  const mk = modal(`<h2>重命名会话</h2>
+    <input class="ipt" id="rn-input" maxlength="80" value="${esc(cur)}" aria-label="会话标题">
+    <div class="row"><button class="btn" data-close="1">取消</button>
+      <button class="btn primary" data-ok="1">保存</button></div>`, async (e, m) => {
+      if (!e.target.dataset.ok) return;
+      const r = await api('/api/session/rename', {id: sid, title: $('rn-input').value});
+      if (r.error) return notice(r.error);
+      m.remove(); reloadSessions();
+    });
+  const box = $('rn-input');
+  box.focus(); box.select();
+  box.onkeydown = e => {                      // 回车即保存，和别处的输入框一致
+    if (e.key === 'Enter') { e.preventDefault(); mk.querySelector('[data-ok]').click(); }
+  };
+}
+$('sessions').addEventListener('click', async e => {
+  // 三点按钮长在会话行【里面】，不先拦住的话点它会连带把这个会话也切过去
+  const kb = e.target.closest('[data-menu]');
+  if (kb) { e.stopPropagation(); return sessionMenu(kb, kb.dataset.menu); }
+  const go = e.target.closest('[data-go-ws]');    // → 按钮：切到这个工作区
+  if (go) {
+    e.stopPropagation();
+    const r = await api('/api/workspace', {cwd: go.dataset.goWs});
+    return r.error ? notice(r.error) : null;
+  }
+  const grp = e.target.closest('[data-ws]');      // 分组头本身：折叠 / 展开
+  if (grp) {
+    const cwd = grp.dataset.ws;
+    if (wsFold.has(cwd)) wsFold.delete(cwd); else wsFold.add(cwd);
+    saveFold();
+    grp.classList.toggle('fold', wsFold.has(cwd));
+    grp.setAttribute('aria-expanded', String(!wsFold.has(cwd)));
+    const body = grp.nextElementSibling;
+    if (body && body.classList.contains('wsbody')) body.hidden = wsFold.has(cwd);
+    return;
+  }
+  const it = e.target.closest('[data-sid]');
+  if (!it || busy) return;
+  if (showArchived) return notice('这是已归档的会话——先取消归档再切过去');
+  // 会话可能属于别的工作区：resume 只在【当前】工作区里找 id，找不到会回"会话不存在"。
+  // 所以先把工作区切过去，再切会话。
+  const body = it.closest('.wsbody');
+  const owner = body && body.previousElementSibling;      // 组内会话紧跟在它的分组头后面
+  if (owner && owner.dataset.ws && !owner.classList.contains('cur')) {
+    const w = await api('/api/workspace', {cwd: owner.dataset.ws});
+    if (w.error) return notice(w.error);
+  }
+  const r = await api('/api/resume', {id: it.dataset.sid});
+  if (r.error) notice(r.error);
+});
+
+// ---- 选一个文件夹当工作区 ----
+/* 优先走系统自带的文件夹对话框（桌面应用该有的样子）。
+   没有图形界面时服务端会回 fallback，再退回页面内那个自绘选择器。 */
+$('ws-add').onclick = async e => {
+  e.stopPropagation();
+  const btn = $('ws-add');
+  btn.disabled = true; btn.textContent = '…';
+  const r = await api('/api/workspace/pick', {});
+  btn.disabled = false; btn.innerHTML = IC.plus;
+  if (r.fallback) return pickFolder();          // 无图形界面 → 用页面内的
+  if (r.error) return notice(r.error);
+};
+
+async function pickFolder(start){
+  const r = await get('/api/browse' + (start ? '?path=' + encodeURIComponent(start) : ''));
+  if (r.error) return notice(r.error);
+  const mk = modal(`<h2>选择工作区</h2>
+    <div class="pkpath">${esc(r.path)}</div>
+    <div class="picker">
+      ${r.parent ? `<div class="pkrow" data-go="${esc(r.parent)}">${FOLDER}<b>..</b>　返回上一级</div>` : ''}
+      ${r.dirs.map(d => `<div class="pkrow" data-go="${esc(d.path)}">${FOLDER}${esc(d.name)}</div>`).join('')
+        || '<div class="empty" style="padding:12px">这个文件夹里没有子文件夹</div>'}
+    </div>
+    <div class="row"><button class="btn" data-close="1">取消</button>
+      <button class="btn primary" data-pick="1">用当前这个文件夹</button></div>`, async (ev, m) => {
+      const go = ev.target.closest('[data-go]');
+      if (go) { m.remove(); return pickFolder(go.dataset.go); }
+      if (!ev.target.dataset.pick) return;
+      const res = await api('/api/workspace', {cwd: r.path});
+      if (res.error) return notice(res.error);
+      m.remove();
+    }, 'settings');
+  return mk;
+}
+function renderBg(list){
+  const bar = $('bgbar');
+  bar.hidden = !list.length;                 // 没有后台任务就不占位
+  // started_at_wall 是服务端给的绝对时刻；"已 N 秒"由前端本地算，服务端不必每秒推一帧
+  bar.innerHTML = list.map(t => `
+    <div class="bgrow" data-bg="${t.id}">
+      <span class="cpip"></span>
+      <span class="nm">${esc((t.description || t.command).slice(0, 70))}</span>
+      <span class="el" data-since="${t.started_at_wall}">#${t.id} · 已 ${since(t.started_at_wall)}</span>
+      <button class="mini" data-out="${t.id}">看输出</button>
+      <button class="mini" data-kill="${t.id}">终止</button>
+    </div>`).join('');
+}
+$('bgbar').addEventListener('click', async e => {
+  const kill = e.target.dataset.kill, out = e.target.dataset.out;
+  if (kill) { const r = await api('/api/bg/kill', {id:Number(kill)}); if (!r.ok) notice('任务已不在了'); }
+  if (out) { const r = await get('/api/bg/output?id=' + out);
+             showText(`后台任务 #${out}`, r.output || '（还没有输出）'); }
+});
+setInterval(() => {          // 只改"已 N 秒"这一处文本，不重建 DOM（否则点击会被打断）
+  document.querySelectorAll('#bgbar [data-since]').forEach(el => {
+    const head = el.textContent.split('·')[0].trim();
+    el.textContent = `${head} · 已 ${since(Number(el.dataset.since))}`;
+  });
+}, 1000);
+/** 右栏两块都空 → 整条收起。有一块有内容就展开。 */
+function syncSide(){
+  const nT = +$('n-tasks').textContent || 0, nW = +$('n-wf').textContent || 0;
+  $('sec-tasks').hidden = !nT;
+  $('sec-wf').hidden = !nW;
+  $('side').hidden = !nT && !nW;
+}
+
+function renderTasks(list){
+  $('n-tasks').textContent = list.length;
+  $('tasks').innerHTML = list.map(t => `
+    <div class="item" data-task="${esc(t.id)}"><span class="pip ${esc(t.status)}"></span>${esc(t.subject || '')}</div>`
+  ).join('');
+  syncSide();
+}
+$('tasks').addEventListener('click', async e => {
+  const it = e.target.closest('[data-task]');
+  if (!it) return;
+  const t = await get('/api/task?id=' + encodeURIComponent(it.dataset.task));
+  if (t.error) return notice(t.error);
+  showText(t.subject || '任务', `状态：${t.status}\n负责：${t.owner || '—'}\n\n${t.description || '（无描述）'}`);
+});
+function renderWorkflow(wf){
+  const st = (wf && wf.stages) || [];
+  $('n-wf').textContent = st.length;
+  $('wf').innerHTML = st.map(s => `
+    <div class="stage ${(s.after || []).length ? 'dep' : ''}" title="${esc(s.result || '')}">
+      <span class="pip ${esc(s.status)}"></span>${esc(s.description || s.id)}</div>`).join('');
+  syncSide();
+}
+
+// ---- 顶栏 / 统计 ----
+/** 状态灯。state: run 绿 / idle 灰 / off 红。
+    整块重画而不是只改 textContent——圆点是它的一部分，只改文字会把圆点冲掉。 */
+function setConn(state, text){
+  const el = $('conn');
+  el.className = 'tag conn ' + state;
+  el.innerHTML = '<span class="cpip"></span>' + esc(text);
+}
+function setBusy(v){
+  busy = v;
+  setConn(v ? 'run' : 'idle', v ? '运行中' : '空闲');
+  $('runner').hidden = !v;          // 标题左边那三个跳动的点
+  $('send').hidden = v; $('stop').hidden = !v;
+}
+const RING_C = 2 * Math.PI * 9;        // 半径 9 的整圈周长，画弧用
+
+function renderStat(){
+  // 每段【必须各自裹一个 span】：.statline 是 flex 容器，直接放在里面的裸文字
+  // 会被包成匿名 flex 项——"2" 和 "轮" 就成了两个项，一 wrap 就一行一个字，竖着排下来。
+  const parts = [];
+  if (turns) parts.push(`<span><b>${turns}</b> 轮</span>`);
+  if (toolCalls) parts.push(`<span><b>${toolCalls}</b> 次工具</span>`);
+  if (lastUsage) {
+    // completion 是【含思考】的。思考那部分看不见却照样按输出价计费，
+    // 只报总数会让人以为"就输出了这么点"，所以有就把它拆出来。
+    const rt = lastUsage.reasoning || 0;
+    parts.push(`<span>输出 <b>${lastUsage.completion}</b> tok${
+      rt ? `（思考 <b>${rt}</b>）` : ''}</span>`);
+  }
+  $('stat').innerHTML = parts.join('<span class="sep">|</span>');
+  renderRing();
+}
+
+/** 压缩进度环：满 = 下一轮就会压。分母用【压缩触发点】而不是上下文上限——
+    上限那个数用户其实碰不到，压缩先发生，拿上限当分母会让人以为还很空。 */
+function renderRing(){
+  const ring = $('ring');
+  if (!compactAt) { ring.hidden = true; return; }
+  ring.hidden = false;
+  const pct = Math.min(1, ctxUsed / compactAt);
+  const left = Math.max(0, Math.round((1 - pct) * 100));
+  ring.className = 'ring' + (pct >= .85 ? ' hot' : pct >= .65 ? ' warn' : '');
+  ring.title = pct >= 1
+    ? `已到压缩点（${ctxUsed.toLocaleString()} tok），下一轮开头会自动压缩。点击立即压缩`
+    : `剩 ${left}% 压缩　·　${ctxUsed.toLocaleString()} / ${compactAt.toLocaleString()} tok`
+      + `（上限 ${ctxLimit.toLocaleString()}）。点击立即压缩`;
+  const val = ring.querySelector('.val');
+  val.style.strokeDasharray = RING_C;
+  val.style.strokeDashoffset = RING_C * (1 - pct);   // 剩下的部分用 offset 顶掉
+  $('ring-txt').textContent = `${(ctxUsed/1000).toFixed(0)}k/${(compactAt/1000).toFixed(0)}k`;
+}
+
+$('ring').onclick = async () => {
+  const r = await api('/api/compact', {});
+  if (r.error) notice(r.error);
+};
+function applyState(s){
+  if (s.error) return;
+  ctxLimit = s.context_limit || 0;
+  compactAt = s.compact_at || 0;
+  ctxUsed = s.context_tokens || ctxUsed;
+  setModeUI(s.mode);
+  $('mode-txt').dataset.k = s.mode;
+  $('model').textContent = s.model || '未配置';
+  curSession = s.session || '';
+  setBusy(!!s.busy);
+  if (s.pending_plan && $('planbar').hidden) showPlanBar('');   // 刷新/重连后把待批条挂回来
+  // MCP 有 server 没连上 → 设置按钮标红点。启动时那条 notice 很可能发在浏览器连上之前
+  // （Bus 没有订阅者就直接丢），只靠它的话用户一点提示都收不到。
+  const bad = $('mcp-bad');
+  bad.hidden = !s.mcp_errors;
+  bad.title = s.mcp_errors ? `${s.mcp_errors} 个 MCP server 没连上` : '';
+  renderStat();
+  reloadSessions().then(r => {
+    // 归档视图里当前会话不在表里，标题就会被清空——只有正常视图才据此改标题
+    if (!showArchived && !(r.sessions || []).some(x => x.current)) $('title').textContent = '新会话';
+  });
+}
+
+// ---- 历史（带 tool_calls 配对 + 向前分页）----
+function renderHistoryPage(items, prepend){
+  // 工具结果按 tool_call_id 贴回它的调用下方；少了这层配对就会渲成
+  // "一堆调用后面跟一堆结果"，完全看不出谁对谁。
+  const results = new Map();
+  for (const m of items) if (m.role === 'tool' && m.tool_call_id) results.set(m.tool_call_id, m.text);
+  const frag = document.createDocumentFragment();
+  for (const m of items) {
+    if (m.role === 'tool') continue;                       // 已经贴到调用下方了
+    if (m.role === 'user' && m.reminder) continue;         // 注入的提醒不铺进对话
+    const d = document.createElement('div');
+    d.className = 'msg ' + (m.role === 'user' ? 'user' : 'bot');
+    if ((m.text || '').trim()) {
+      const b = document.createElement('div'); b.className = 'bubble';
+      if (m.role === 'user') b.textContent = m.text;    // 用户原话不渲染：他打的是什么就显示什么
+      else { b._raw = m.text; paintMd(b, true); }
+      d.appendChild(b);
+      const acts = document.createElement('div'); acts.className = 'acts';
+      acts.appendChild(copyBtn(() => m.text));          // 历史也要能复制，且拿的是原文
+      d.appendChild(acts);
+    }
+    for (const c of m.tool_calls || []) {
+      const box = toolNode(c.name, c.args);
+      const sp = box.querySelector('.spin'); if (sp) sp.remove();
+      box.querySelector('.tout').textContent = results.get(c.id) || '（无结果）';
+      d.appendChild(box);
+    }
+    frag.appendChild(d);
+  }
+  if (prepend) col.insertBefore(frag, col.firstChild); else col.appendChild(frag);
+}
+let loadingMore = false;
+
+async function loadHistory(reset){
+  if (reset) { col.innerHTML = ''; histBefore = 0; toolBox.clear(); liveKind = null; }
+  const m = $('main');
+  const h0 = m.scrollHeight, t0 = m.scrollTop;     // 前插会把已有内容整体往下推
+  const r = await get(`/api/history?before=${histBefore}`);
+  if (r.error) return;
+  histTotal = r.total; histBefore = r.next_before;
+  if (r.items.length) enterChat();
+  renderHistoryPage(r.items, !reset);
+  refreshLoadMore();
+  if (reset) return scroll();
+  // 视线钉在原来那条消息上：新内容加在上面，把滚动位置往下挪同样的高度。
+  // 不补偿的话每加载一页，正在看的那条就被推出视野，越翻越乱。
+  m.scrollTop = t0 + (m.scrollHeight - h0);
+}
+
+/** 顶部那条"还有 N 条"。自动加载已经够用了，留着它是因为：
+    历史比视口还短时根本滚不动，滚动事件永远不触发，只能靠点。 */
+function refreshLoadMore(){
+  const old = col.querySelector('.loadmore');
+  if (old) old.remove();
+  if (!histBefore) return;
+  const b = document.createElement('button');
+  b.className = 'btn loadmore';
+  b.textContent = `↑ 加载更早（还有 ${histTotal - histBefore} 条）`;
+  b.onclick = () => loadHistory(false);
+  col.insertBefore(b, col.firstChild);
+}
+
+// 上滑到顶自动加载更早。
+// 阈值取 140px 而不是 0：等真正贴顶才开始取，用户已经撞到底了，会有明显的一顿。
+// loadingMore 这把锁不能省——滚动事件一次滑动能连发几十下，没锁就是几十个并发请求，
+// 每个都拿【当时那个】histBefore，同一页会被重复插进去。
+$('main').addEventListener('scroll', () => {
+  if (loadingMore || !histBefore || $('main').scrollTop > 140) return;
+  loadingMore = true;
+  loadHistory(false).finally(() => { loadingMore = false; });
+});
+
+// 代码块的复制按钮。渲染出来的节点没法逐个挂 onclick，统一委托到对话列。
+col.addEventListener('click', e => {
+  const b = e.target.closest('.md-cp');
+  if (!b) return;
+  const code = b.parentElement.querySelector('code');
+  if (!code || !navigator.clipboard) return;
+  navigator.clipboard.writeText(code.textContent).then(() => {
+    b.textContent = '已复制';
+    setTimeout(() => { b.textContent = '复制'; }, 1200);
+  });
+});
+
+// ---- SSE：EventSource 设不了自定义头，token 只能走查询串 ----
+const es = new EventSource('/api/events?token=' + encodeURIComponent(TOKEN));
+es.onmessage = e => {
+  const m = JSON.parse(e.data);
+  switch (m.type) {
+    case 'state':          applyState(m); break;
+    case 'text':           stream('text', m.text); break;
+    case 'reasoning':      stream('reasoning', m.text); break;
+    case 'tool_start':     toolStart(m); break;
+    case 'tool_result':    toolResult(m); break;
+    case 'notice':         notice(m.text); break;
+    case 'plan':           showPlanBar(m.plan); break;
+    case 'ask_permission': askPermission(m); break;
+    case 'ask_user':       askUser(m); break;
+    case 'dismiss':        dismiss(m.id); break;
+    case 'bg':             renderBg(m.bg || []); break;
+    case 'tasks':          renderTasks(m.tasks || []); break;
+    case 'workflow':       renderWorkflow(m.workflow); break;
+    case 'usage':          lastUsage = m; renderStat(); break;
+    case 'bg_done':
+      notice(`后台任务 #${m.id}${m.description ? '（' + m.description + '）' : ''} ${m.status}`
+             + (m.exit_code != null ? `，退出码 ${m.exit_code}` : '')
+             + (m.output ? '：' + m.output.slice(0, 300) : ''));
+      break;
+    case 'turn_start':
+      // 用户消息由【发起的那个标签页】本地回显（体感更快），其余标签页照着这条渲——
+      // 不然在 B 标签页看不到 A 标签页刚发的话，对话就断了。
+      setBusy(true); turns++; renderStat();
+      if (m.kind === 'user' && m.text) {
+        if (!claimEcho(m.text)) userBubble(m.text);
+      }
+      break;
+    case 'queued':
+      // 和 turn_start 同一个约定：本地已经乐观渲过就只认领、不重复渲
+      if (!claimEcho(m.text)) userBubble(m.text, true);
+      break;
+    case 'resumed':
+      curSession = m.session; turns = 0; toolCalls = 0; lastUsage = null;
+      $('planbar').hidden = true; pendingPlan = '';      // 换会话先收掉旧的待批条
+      loadHistory(true).then(() => { $('title').textContent = m.title || '新会话'; });
+      get('/api/state').then(applyState);
+      break;
+    case 'turn_end':
+      // 节流可能正压着最后一帧没画；这里无条件定稿一次，否则末尾几个字要等 66ms 才出来
+      if (live && live._raw != null && liveKind === 'text') paintMd(live, true);
+      liveKind = null; setBusy(false);
+      if (m.context_tokens) ctxUsed = m.context_tokens;
+      renderStat();
+      break;
+    case 'sessions_changed': reloadSessions(); break;   // 改名/归档：别的标签页也要跟着变
+    case 'ping':           break;
+  }
+};
+es.onerror = () => setConn('off', '连接断开');
+// 断线期间发的消息，它们的 turn_start / queued 事件已经随连接一起丢了，
+// 认领记号留着只会去认领【将来某条内容相同的消息】，把别的标签页发的那条吃掉不渲。
+// 重连时一律清空：这一刻起的事件才有对应的本地回显。
+// 连接状态不用在这里改：服务端一订阅就补发一帧 state，applyState 会把它调对。
+es.onopen = () => { pendingEcho.length = 0; };
+
+// ---- 交互 ----
+const input = $('input');
+
+/* 自动变高。【不能】走 "height=auto 再读 scrollHeight" 那一套：
+   设 auto 把布局弄脏，紧接着读 scrollHeight 会逼浏览器立刻把【整页】重算一遍——
+   而整页底下挂着整条对话。一次几百毫秒，粘一大段文本就是卡好几秒。
+   改用离屏镜像量：镜像脱离文档流，改它不弄脏可见布局，量完一次性写回高度。 */
+const mirror = document.createElement('div');
+mirror.id = 'ta-mirror';
+mirror.setAttribute('aria-hidden', 'true');
+input.parentNode.insertBefore(mirror, input);
+{
+  // 字体/行高/内边距只需对齐一次：它们不随窗口变，宽度则靠 CSS 左右贴边自动跟随
+  const cs = getComputedStyle(input);
+  for (const k of ['fontFamily', 'fontSize', 'fontWeight', 'lineHeight',
+                   'letterSpacing', 'padding', 'borderWidth', 'boxSizing'])
+    mirror.style[k] = cs[k];
+}
+function autosize(){
+  // 末尾补一个换行：文本正好以换行结尾时，最后那个空行不占高度，量出来会少一行
+  mirror.textContent = input.value + '\n';
+  input.style.height = Math.min(mirror.scrollHeight, 200) + 'px';
+}
+input.addEventListener('input', autosize);
+input.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+async function send(){
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = ''; autosize();
+  // 【必须在发请求之前入队】。服务端是"先 emit 再 return"：turn_start / queued 在 HTTP
+  // 响应写回【之前】就已经推到 SSE 上了。等 await 回来再记就晚了一步——
+  // 抢先到达的那条事件认领不到本地回显，自己又渲一个，表现成"第一条消息发两遍"
+  // （新会话最容易撞上：没有别的流量，SSE 稳稳跑赢 HTTP 响应）。
+  pendingEcho.push(text);
+  const node = userBubble(text);
+  const r = await api('/api/send', {text});
+  if (r.error) {
+    claimEcho(text);                            // 没发出去，把记号撤回来
+    node.remove();
+    return notice(r.error);
+  }
+  // 排队的那条服务端会推 queued 事件；这里把已经渲好的气泡改成排队样式即可
+  if (r.queued) node.classList.add('queued'); else setBusy(true);
+}
+$('send').onclick = send;
+$('stop').onclick = () => api('/api/interrupt');
+/** 锚定浮层：贴着 anchor 弹出。默认往上开（触发器都在底部输入框那一行），
+    上方不够就翻到下面；左右夹在视口内，免得贴边时被切掉一半。 */
+function popover(anchor, html, onClick, minW){
+  document.querySelectorAll('.pop').forEach(x => x.remove());
+  const pop = document.createElement('div');
+  pop.className = 'pop'; pop.innerHTML = html;
+  // minW：浮层是某个控件的下拉列表时传控件宽度，列表至少和控件一样宽（下限见 .pop 的 max()）
+  if (minW) pop.style.setProperty('--anchor-w', minW + 'px');
+  document.body.appendChild(pop);              // 先挂上才量得到尺寸
+  const r = anchor.getBoundingClientRect();
+  const gap = 8;
+  const up = r.top - pop.offsetHeight - gap;
+  pop.style.top = (up >= gap ? up : r.bottom + gap) + 'px';
+  pop.style.left = Math.max(gap,
+    Math.min(r.left, innerWidth - pop.offsetWidth - gap)) + 'px';
+  const close = () => {
+    pop.remove();
+    document.removeEventListener('keydown', onKey, true);
+    document.removeEventListener('scroll', close, true);
+  };
+  const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  // 浮层是 fixed 定位、按打开那一刻的位置钉死的，底下的容器一滚它就飘在错的地方
+  // （设置面板内容区是能滚的）。捕获阶段才收得到内部容器的滚动。
+  document.addEventListener('scroll', close, true);
+  pop.addEventListener('click', e => onClick(e, close));
+  // 捕获阶段监听：点到别处就关。setTimeout 是为了跳过【触发这次打开的那一下点击】
+  // ——不跳过的话同一个事件会立刻把刚弹出来的浮层关掉。
+  setTimeout(() => document.addEventListener('click', function away(e){
+    if (!pop.contains(e.target)) { close(); document.removeEventListener('click', away, true); }
+  }, true), 0);
+  document.addEventListener('keydown', onKey, true);
+  return pop;
+}
+
+/** 模式选择。四档差别不小（尤其"完全"），循环点容易一不小心切过头，改成显式选。 */
+function openModes(anchor, cur){
+  popover(anchor, MODES.map(m => `
+    <div class="mode-opt ${m.k === cur ? 'on' : ''}" data-m="${m.k}" tabindex="0">
+      ${modeIcon(m.k)}<div><div class="mt">${m.t}</div><div class="md">${m.d}</div></div></div>`).join(''),
+    async (e, close) => {
+      const opt = e.target.closest('[data-m]');
+      if (!opt) return;
+      close();
+      const r = await api('/api/mode', {mode: opt.dataset.m});
+      if (r && r.mode) setModeUI(r.mode);
+    });
+}
+function setModeUI(k){
+  const m = MODES.find(x => x.k === k) || MODES[0];
+  $('mode-ico').innerHTML = modeIcon(k);
+  $('mode-txt').textContent = m.t;
+}
+$('mode').onclick = e => openModes(e.currentTarget, $('mode-txt').dataset.k || 'normal');
+/** 计划待批准：非模态条压在输入框上方——先让人读完计划再批，弹模态会挡住正文。
+    条上"查看计划"看全文；"批准执行"切回执行模式并起一轮。 */
+let pendingPlan = '';
+function showPlanBar(plan){
+  pendingPlan = plan || '';
+  $('planbar').hidden = false;
+}
+$('plan-view').onclick = () => {
+  if (pendingPlan) showText('待批准的计划', pendingPlan);
+  else get('/api/plan').then(r => showText('待批准的计划', r.plan || '（读不到计划文件）'));
+};
+$('plan-ok').onclick = async () => {
+  const r = await api('/api/plan/approve', {});
+  if (r.error) return notice(r.error);
+  $('planbar').hidden = true; pendingPlan = '';
+};
+
+// 箭头包一层不是多余的：openSettings 定义在后加载的 settings.js 里，
+// 写成 onclick = openSettings 会在绑定这一刻取到 undefined。
+$('model').onclick = () => openSettings('model');     // 点模型名直接落到模型页
+$('settings').onclick = () => openSettings();
+$('new').onclick = async () => {
+  const r = await api('/api/session/new', {});
+  if (r.error) notice(r.error);
+};
+function toggleRail(show){
+  $('rail').hidden = !show;
+  $('rail-show').hidden = show;
+  if (!show) $('topbar').hidden = false;      // 收起侧栏后要有地方放展开按钮
+}
+$('ws-add').innerHTML = IC.plus;      // HTML 里留空，图标统一由 IC 填，免得两处形状对不上
+document.querySelector('.newbtn .ig').innerHTML = IC.plus;
+document.querySelector('#mode .car').innerHTML = IC.chev;
+$('rail-hide').onclick = () => toggleRail(false);
+$('rail-show').onclick = () => toggleRail(true);
+
+// ---- 侧栏拖宽 ----
+const RAIL_MIN = 200, RAIL_MAX = 520, RAIL_DEFAULT = 276;
+const setRail = px => document.documentElement.style
+  .setProperty('--rail', Math.round(Math.min(RAIL_MAX, Math.max(RAIL_MIN, px))) + 'px');
+try {                                        // 记住上次拖到的宽度
+  const w = +localStorage.getItem('mecode-rail');
+  if (w) setRail(w);
+} catch (e) {}
+
+const grip = $('grip');
+// 用 pointer 事件 + setPointerCapture，不往 document 上挂 mousemove：
+// 指针拖出窗口再松开时 mouseup 收不到，侧栏会一直粘着跟手走。
+// 捕获之后不管指针跑到哪，事件都还回到这个元素上，pointerup 一定收得到。
+grip.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  grip.setPointerCapture(e.pointerId);
+  grip.classList.add('on');
+  document.body.classList.add('resizing');
+});
+grip.addEventListener('pointermove', e => {
+  if (!grip.hasPointerCapture(e.pointerId)) return;
+  setRail(e.clientX);                        // 侧栏贴左边，指针的 x 就是它该有的宽度
+});
+const endResize = e => {
+  if (!grip.hasPointerCapture(e.pointerId)) return;
+  grip.releasePointerCapture(e.pointerId);
+  grip.classList.remove('on');
+  document.body.classList.remove('resizing');
+  try {
+    localStorage.setItem('mecode-rail',
+      parseInt(getComputedStyle(document.documentElement).getPropertyValue('--rail'), 10));
+  } catch (err) {}
+};
+grip.addEventListener('pointerup', endResize);
+grip.addEventListener('pointercancel', endResize);
+grip.ondblclick = () => {                    // 拖乱了给个一键回默认
+  setRail(RAIL_DEFAULT);
+  try { localStorage.removeItem('mecode-rail'); } catch (e) {}
+};
+
+get('/api/state').then(applyState);
+loadHistory(true);
+input.focus();
+</script>
+<!-- 设置面板：经典脚本，与上面的内联脚本共享全局词法环境；顺序不能提前 -->
+<script src="settings.js"></script>
+</body>
+</html>

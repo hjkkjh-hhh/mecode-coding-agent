@@ -68,15 +68,17 @@
 | headless 入口 | `bootstrap.py` + `cli.py` | build_agent() 工厂、Agent.ask()、全局 `mecode` 命令——程序也能用,不只人能用 |
 | 模型配置 | `config.py` + `registry.py` | config.json 单一真相源、/config 可视化配置、热切换(不重启) |
 | TUI | `scripts/tui.py` | textual 终端界面:流式渲染、工具批折叠、审批弹窗、可拖侧栏 |
+| 桌面端 | `scripts/deskserve.py` + `desktop/` | 本地 HTTP 服务(SSE 下行 + POST 上行,零新依赖)+ 浏览器界面:Markdown 渲染、工具卡片、设置面板(模型/技能/MCP)、多工作区、随机 token 信任闸 |
 
-360 个测试(pytest),覆盖每个子系统的关键不变量。
+629 个测试(pytest)+ 216 个前端自检(node,无浏览器),覆盖每个子系统的关键不变量。
 
 ## 整体架构
 
 ```
   人机入口                            程序入口 (headless)
   tui.py (textual TUI)               from mecode import build_agent
-  chat.py (CLI REPL)                 mecode -p "..."  (脚本 / CI)
+  deskserve.py + desktop/ (浏览器)    mecode -p "..."  (脚本 / CI)
+  chat.py (CLI REPL)
       │                                  │
       └──────────────┬───────────────────┘
                      │  事件流 (events.py)
@@ -103,6 +105,7 @@
 git clone https://github.com/hjkkjh-hhh/mecode && cd mecode
 pip install -e .        # 装出全局 mecode 命令(依赖一并装上)
 mecode                  # 打开 TUI
+mecode desk             # 打开桌面端(起本地服务 + 自动开浏览器)
 ```
 
 首次启动后输入 `/config`,在配置界面里选一家模型(Kimi/DeepSeek/GLM/MiniMax 一键预设,只需粘贴 API Key;其他 OpenAI 兼容后端手动填写),保存即用。配置存在 `~/.mecode/config.json`,与任何 repo 隔离。
@@ -166,8 +169,9 @@ mecode -p "总结这个项目" --mode auto          # 一次性:跑完打印答�
 
 ```
 src/mecode/     框架本体(库,可 import):agent/provider/tools/… + bootstrap(headless 工厂) + cli(mecode 命令)
-scripts/        应用层入口:tui.py(主界面)、chat.py(调试 CLI)、raw_probe.py(裸流探针)
-tests/          360 个单元/集成测试
+scripts/        应用层入口:tui.py(主界面)、deskserve.py(桌面端服务)、chat.py(调试 CLI)、raw_probe.py(裸流探针)
+desktop/        桌面端前端:index.html(界面 + 全部样式 + 主循环)、settings.js(设置面板)、markdown.js(零依赖渲染器)
+tests/          629 个单元/集成测试 + tests/js/ 前端自检
 ```
 
 ## 背景
