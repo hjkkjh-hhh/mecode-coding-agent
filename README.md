@@ -1,16 +1,16 @@
 # mecode
 
-![tests](https://img.shields.io/badge/tests-360_passed-brightgreen)
+![tests](https://img.shields.io/badge/tests-629_pytest_%2B_216_js-brightgreen)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![models](https://img.shields.io/badge/models-Kimi_·_DeepSeek_·_GLM_·_MiniMax-orange)
-![lines](https://img.shields.io/badge/lines-13.4k-lightgrey)
+![lines](https://img.shields.io/badge/lines-25k-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 **面向国产模型生态的、可读可学的 coding agent harness。**
 
-用 Python 从零手写一套完整的 agent 框架——不是 demo,是把 Claude Code 这类产品的每一块"脊椎"都亲手造一遍:agent 主循环、流式解析、上下文压缩、会话持久化、工具权限、MCP、子 agent、后台任务、跨会话记忆、多模型思考链适配、skill 系统、workflow 编排。
+用 Python 从零手写一套完整的 agent 框架——不是 demo,是把 Claude Code 这类产品的每一块"脊椎"都亲手造一遍:agent 主循环、流式解析、上下文压缩、会话持久化、工具权限、MCP、子 agent、后台任务、跨会话记忆、多模型思考链适配、skill 系统、workflow 编排。两个界面(终端 TUI / 浏览器桌面端)共用同一个内核。
 
-**1.3 万行,行行读得过来**(核心 ~5,500 行 + 入口层 ~3,800 行 + 测试 ~4,200 行)。每个子系统的注释写的不是"这行干了什么",而是**为什么这么设计、别的方案为什么不行**。
+**2.5 万行,行行读得过来**(核心 ~6,600 + 入口层 ~7,100 + 桌面端前端 ~2,800 + 测试 ~8,700)。每个子系统的注释写的不是"这行干了什么",而是**为什么这么设计、别的方案为什么不行**。
 
 > 有人拆完泄露的 51 万行 Claude Code 源码后结论是:"值得看,不值得研究"——因为不完整、跑不起来、无法调试。mecode 想站的位置恰好是**值得研究**:小一个量级、全部可跑、可断点、每处取舍有注释。
 
@@ -47,7 +47,18 @@
 
 实现:`compact.py` + `agent.py`。
 
-### 3. 完整的子系统,每块都能单独读
+### 3. 两个界面,一个内核(终端 / 浏览器)
+
+`mecode` 开 TUI,`mecode desk` 开桌面端——同一个 Agent、同一套事件流(`events.py`),只是渲染在两个地方。桌面端**零新依赖**:stdlib 的 `ThreadingHTTPServer` + SSE 下行 + POST 上行,不引 Web 框架;前端也没有构建步骤,几个静态文件直接开。
+
+两处值得看:
+
+- **信任闸**(三道缺一不可)。服务监听本地端口、且桌面端必然跑在 auto/yolo 档——等于本机任何进程都能驱动 agent 跑任意 bash。浏览器的同源策略也拦不住:跨域 POST 属于简单请求,不触发预检就能发出去,一个恶意网页就能远程操纵你的 agent。所以:启动时生成随机 token 注入进 index.html(**首页本身也要拦**,放行等于把 token 白送)+ Host 头必须是回环地址(挡 DNS rebinding)+ Origin 校验(挡跨站请求)。**只绑 127.0.0.1 本身不够**——同机的其它程序照样连得上。
+- **阻塞往返**。`ask_permission` 是 agent 工作线程上的**同步阻塞调用**,而答复得经过一趟浏览器再回来;"服务端向客户端发起请求"在 HTTP 里没有现成形状。做法:待答复请求登记成表 → 工作线程在 `Event` 上等 → SSE 把请求推给前端 → 前端 POST 回来唤醒。前端新连上时**重放未答复的请求**——刷新页面后那张审批窗必须回来,否则工作线程还在等、用户却看不到任何可点的东西。
+
+实现:`scripts/deskserve.py` + `desktop/`。
+
+### 4. 完整的子系统,每块都能单独读
 
 | 子系统 | 文件 | 一句话 |
 |---|---|---|
@@ -75,12 +86,12 @@
 ## 整体架构
 
 ```
-  人机入口                            程序入口 (headless)
-  tui.py (textual TUI)               from mecode import build_agent
-  deskserve.py + desktop/ (浏览器)    mecode -p "..."  (脚本 / CI)
-  chat.py (CLI REPL)
-      │                                  │
-      └──────────────┬───────────────────┘
+  人机入口                         程序入口 (headless)
+  tui.py       (textual 终端)     from mecode import build_agent
+  deskserve.py (浏览器桌面端)     mecode -p "..."  (脚本 / CI)
+  chat.py      (CLI REPL)
+      │                           │
+      └──────────────┬────────────┘
                      │  事件流 (events.py)
              ┌───────▼────────┐
              │  Agent 主循环  │   agent.py: 模型 ↔ 工具,循环到收敛
@@ -105,8 +116,10 @@
 git clone https://github.com/hjkkjh-hhh/mecode && cd mecode
 pip install -e .        # 装出全局 mecode 命令(依赖一并装上)
 mecode                  # 打开 TUI
-mecode desk             # 打开桌面端(起本地服务 + 自动开浏览器)
+mecode desk             # 打开桌面端:起本地服务 + 自动开浏览器
 ```
+
+`mecode desk` 不给端口就让系统分配(同时开两个工作区不会撞);`--no-open` 只打印带 token 的地址,`--cwd D:/x` 换工作区。
 
 首次启动后输入 `/config`,在配置界面里选一家模型(Kimi/DeepSeek/GLM/MiniMax 一键预设,只需粘贴 API Key;其他 OpenAI 兼容后端手动填写),保存即用。配置存在 `~/.mecode/config.json`,与任何 repo 隔离。
 
@@ -131,7 +144,7 @@ mecode -p "总结这个项目" --mode auto          # 一次性:跑完打印答�
 
 无头环境没人点审批弹窗,`mode` 选权限档位:`auto`(默认,项目内编辑放行)/ `normal`(≈只读)/ `yolo`(全放,慎用)。后端报错一行人话进 stderr、退出码 1,脚本能干净判失败。
 
-### 常用操作
+### 常用操作(TUI)
 
 | 操作 | 说明 |
 |---|---|
@@ -142,6 +155,8 @@ mecode -p "总结这个项目" --mode auto          # 一次性:跑完打印答�
 | `/rl` `/rs` | 续上最近会话 / 从列表挑会话 |
 | `Ctrl+C` | 打断当前轮(工具当场停、进程树杀) |
 | `/system` `/tools` | 查看当前 system prompt / 工具列表 |
+
+桌面端把这些做成了界面,一一对应:模式选择器在标题栏,会话/工作区在左侧栏(可拖宽,鼠标停在会话上出 ⋮ 菜单:改名/分叉/归档),其余全在"设置"里——**通用**(模式、外观、快捷键)、**模型**(切换/新增后端、思考开关与深度、上下文上限 × 压缩阈值)、**技能**、**MCP**、**开发者**(看此刻真发出去的 system prompt)、**关于**。任务清单和工作流在右侧栏,后台任务压在输入框上方。
 
 ## 设计原则(也是这个仓库的读法)
 
@@ -171,7 +186,7 @@ mecode -p "总结这个项目" --mode auto          # 一次性:跑完打印答�
 src/mecode/     框架本体(库,可 import):agent/provider/tools/… + bootstrap(headless 工厂) + cli(mecode 命令)
 scripts/        应用层入口:tui.py(主界面)、deskserve.py(桌面端服务)、chat.py(调试 CLI)、raw_probe.py(裸流探针)
 desktop/        桌面端前端:index.html(界面 + 全部样式 + 主循环)、settings.js(设置面板)、markdown.js(零依赖渲染器)
-tests/          629 个单元/集成测试 + tests/js/ 前端自检
+tests/          629 个单元/集成测试;tests/js/ 另有 216 条前端自检(node 跑,不需要浏览器)
 ```
 
 ## 背景
