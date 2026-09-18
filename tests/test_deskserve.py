@@ -302,6 +302,34 @@ def test_历史带tool_calls_和分页(desk):
     assert len(one["items"]) == 1 and one["total"] == 3
 
 
+def test_历史累计输出token(desk):
+    """输出 token 和轮数/工具次数同口径【从 transcript 现数】——
+    存在前端局部变量里的话，刷新页面就归零，同一行里三个数两种口径。
+    prompt 不累计：多轮之间大量重叠，加起来没有意义。"""
+    st = desk.agent.store
+    st.append_transcript({"role": "user", "content": "问"})
+    st.append_transcript({"role": "assistant", "content": "",
+                          "tool_calls": [{"id": "c1"}],
+                          "usage": {"completion": 30, "reasoning": 25}})
+    st.append_transcript({"role": "tool", "tool_call_id": "c1", "content": "ok"})
+    st.append_transcript({"role": "assistant", "content": "好了",
+                          "usage": {"completion": 868, "reasoning": 842}})
+    h = desk.history()
+    assert h["out_tokens"] == 898        # 30 + 868
+    assert h["think_tokens"] == 867      # 25 + 842
+
+
+def test_历史兼容没有usage的老会话(desk):
+    """老 transcript 里没有 usage 字段，得当 0 处理而不是崩。"""
+    st = desk.agent.store
+    st.append_transcript({"role": "user", "content": "问"})
+    st.append_transcript({"role": "assistant", "content": "答"})          # 没有 usage
+    st.append_transcript({"role": "assistant", "content": "再答",
+                          "usage": {"completion": 10}})                    # 只有一半字段
+    h = desk.history()
+    assert h["out_tokens"] == 10 and h["think_tokens"] == 0
+
+
 def test_历史保留注入的提醒并打标(desk):
     """直接丢掉会让"用户说了什么"和模型看到的对不上，排查问题时找不到北。"""
     desk.agent.store.append_transcript({"role": "user", "content": "<system-reminder>x</system-reminder>"})

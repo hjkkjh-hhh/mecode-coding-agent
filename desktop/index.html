@@ -277,6 +277,11 @@ main::-webkit-scrollbar-track, .modal::-webkit-scrollbar-track, .tool pre::-webk
   background:var(--text-3)}
 .conn.run{color:var(--ok)} .conn.run .cpip{background:var(--ok)}
 .conn.off{color:var(--danger)} .conn.off .cpip{background:var(--danger)}
+/* 正在停止：打断是【协作式】的——标志位置上了，但当前那个工具要跑完才轮到检查点。
+   长工具（递归 glob、跑批 bash）能拖好几秒，这期间不给反馈的话按钮看着就像坏了。 */
+.conn.stopping{color:var(--warn)} .conn.stopping .cpip{background:var(--warn)}
+.conn.stopping .cpip::after{content:""; position:absolute; inset:0; border-radius:50%;
+  background:var(--warn); animation:ping 1.5s cubic-bezier(0,0,.2,1) infinite}
 /* 光晕【另起一层】向外扩，不缩放圆点本身：缩放圆点会撑动 flex 行的高度，整条状态栏跟着抖。
    ::after 是绝对定位的，脱离布局流，怎么放大都不影响旁边的字。 */
 .spin .cpip, .bgrow .cpip{background:var(--ok)}
@@ -536,7 +541,9 @@ code{font-family:var(--mono); font-size:.9em; background:var(--bg-sunken);
 .set-form{display:flex; flex-direction:column; gap:10px; padding:2px 0 6px}
 /* align-items:flex-end —— 里面的输入框上方顶着一行标注（.fld），比按钮高一截；
    按中线对齐会让按钮浮在半空，按底边对齐两者的底线才是齐的。 */
-.set-form.inline{flex-direction:row; align-items:flex-end; gap:8px; flex:0 0 auto; padding:0}
+/* flex-wrap：算式塞不下时自己折行，而不是把左边的标题挤没（见 .set-row 那条注释） */
+.set-form.inline{flex-direction:row; flex-wrap:wrap; align-items:flex-end;
+  gap:8px; row-gap:8px; flex:0 1 auto; padding:0}
 /* 带标注的输入框：标注在上、框在下。父级 .set-form label 是横排的，这里覆写成竖排。 */
 .set-form label.fld{flex-direction:column; align-items:stretch; gap:5px}
 .set-form label.fld > .ipt{flex:0 0 auto}
@@ -634,6 +641,13 @@ textarea::placeholder{color:var(--text-3)}
 .circle:active{transform:scale(.94)}
 .circle.stop{background:var(--danger)}
 .circle.stop svg{width:19px; height:19px}
+/* 已经点过停止：变灰 + 呼吸，表示"收到了，在等当前这步收尾"。
+   再点也只是重复置同一个标志位，所以直接 disabled，别让人以为点了没用而反复点。 */
+.circle.stop.pending{background:var(--text-3); cursor:default;
+  animation:stoppulse 1.2s ease-in-out infinite}
+.circle.stop.pending:hover{filter:none}
+@keyframes stoppulse{0%,100%{opacity:1} 50%{opacity:.55}}
+@media (prefers-reduced-motion:reduce){.circle.stop.pending{animation:none; opacity:.7}}
 @media (prefers-reduced-motion:reduce){.circle:active{transform:none}}
 .statline{font-weight:600; max-width:calc(var(--col) + 32px); margin:9px auto 0; color:var(--text-3);
   font-size:11.5px; display:flex; gap:10px; flex-wrap:wrap; justify-content:center;
@@ -684,9 +698,13 @@ textarea::placeholder{color:var(--text-3)}
 .set-nav button:hover{background:var(--hover)}
 .set-nav button.on{background:var(--active); color:var(--text)}
 .set-main{flex:1; padding:0 20px 20px; overflow-y:auto}
-.set-row{display:flex; align-items:center; gap:20px; padding:16px 0; border-bottom:1px solid var(--border-1)}
+/* flex-wrap + 标题给宽度下限：右侧控件里有 flex:0 0 auto 的（.set-form.inline），
+   它不肯收缩，而 .lab 原来是 flex:1（可缩到 0）。控件一旦变宽（比如算式后面多出
+   "上限被模型窗口 100,000 截住"这句注解），标题就会被挤成一个字符宽、竖着排一列。 */
+.set-row{display:flex; flex-wrap:wrap; align-items:center; gap:20px; row-gap:12px;
+  padding:16px 0; border-bottom:1px solid var(--border-1)}
 .set-row:last-child{border-bottom:0}
-.set-row .lab{flex:1}
+.set-row .lab{flex:1 1 220px; min-width:200px}
 .set-row .lab .t{font-weight:600; font-size:13.5px}
 .set-row .lab .d{font-weight:500; color:var(--text-3); font-size:12.5px; margin-top:3px}
 /* 分段控件：三选一挤在一行里，和别的设置项一样"说明在左、控件在右"。
@@ -935,7 +953,7 @@ const api = (p, b) => fetch(p, {method:'POST',
 const get = p => fetch(p, {headers:{'X-Mecode-Token':TOKEN}})
   .then(r => r.json()).catch(() => ({error:'请求失败'}));
 
-let busy = false, live = null, liveKind = null, curSession = '';
+let busy = false, stopping = false, live = null, liveKind = null, curSession = '';
 let histBefore = 0, histTotal = 0, ctxLimit = 0, ctxUsed = 0, compactAt = 0;
 
 /* 本地已经乐观渲染、还等着对应 SSE 事件来认领的用户消息。
@@ -949,7 +967,10 @@ const claimEcho = text => {
   pendingEcho.splice(i, 1);
   return true;
 };
-let turns = 0, toolCalls = 0, lastUsage = null;
+// 轮数、工具次数都是【累计】的，token 也得是——一行里混两种口径，
+// 17 次工具配一个"237 tok"会让人以为这一整轮才输出了 237 个 token。
+// sumOut/sumThink 累加每次 usage 事件（agent 循环里每次模型响应发一条）。
+let turns = 0, toolCalls = 0, sumOut = 0, sumThink = 0;
 const toolBox = new Map();
 
 const atBottom = () => { const m=$('main'); return m.scrollHeight-m.scrollTop-m.clientHeight < 90; };
@@ -1603,9 +1624,15 @@ function setConn(state, text){
 }
 function setBusy(v){
   busy = v;
-  setConn(v ? 'run' : 'idle', v ? '运行中' : '空闲');
+  if (!v) stopping = false;         // 这一轮真结束了，停止态跟着清
+  setConn(v ? (stopping ? 'stopping' : 'run') : 'idle',
+          v ? (stopping ? '正在停止' : '运行中') : '空闲');
   $('runner').hidden = !v;          // 标题左边那三个跳动的点
   $('send').hidden = v; $('stop').hidden = !v;
+  const s = $('stop');
+  s.classList.toggle('pending', v && stopping);
+  s.disabled = v && stopping;
+  s.title = (v && stopping) ? '正在停止（等当前这步收尾）' : '停止';
 }
 const RING_C = 2 * Math.PI * 9;        // 半径 9 的整圈周长，画弧用
 
@@ -1615,12 +1642,12 @@ function renderStat(){
   const parts = [];
   if (turns) parts.push(`<span><b>${turns}</b> 轮</span>`);
   if (toolCalls) parts.push(`<span><b>${toolCalls}</b> 次工具</span>`);
-  if (lastUsage) {
+  if (sumOut) {
     // completion 是【含思考】的。思考那部分看不见却照样按输出价计费，
     // 只报总数会让人以为"就输出了这么点"，所以有就把它拆出来。
-    const rt = lastUsage.reasoning || 0;
-    parts.push(`<span>输出 <b>${lastUsage.completion}</b> tok${
-      rt ? `（思考 <b>${rt}</b>）` : ''}</span>`);
+    // 思考模型上这个比例很夸张——实测 Qwen3.5-4B 一次 868 tok 里 842 是思考。
+    parts.push(`<span>输出 <b>${sumOut.toLocaleString()}</b> tok${
+      sumThink ? `（思考 <b>${sumThink.toLocaleString()}</b>）` : ''}</span>`);
   }
   $('stat').innerHTML = parts.join('<span class="sep">|</span>');
   renderRing();
@@ -1712,9 +1739,13 @@ async function loadHistory(reset){
   const r = await get(`/api/history?before=${histBefore}`);
   if (r.error) return;
   histTotal = r.total; histBefore = r.next_before;
-  // 轮数/工具次数由服务端从 transcript 现数（见 Desk.history）。只在 reset 那次采信：
+  // 轮数/工具次数/输出 token 都由服务端从 transcript 现数（见 Desk.history）。只在 reset 那次采信：
   // 翻更早的页时它是同一个全量数，但期间可能已经又跑了一轮，覆盖回去就把新的那轮抹掉了。
-  if (reset) { turns = r.turns || 0; toolCalls = r.tool_calls || 0; renderStat(); }
+  if (reset) {
+    turns = r.turns || 0; toolCalls = r.tool_calls || 0;
+    sumOut = r.out_tokens || 0; sumThink = r.think_tokens || 0;
+    renderStat();
+  }
   if (r.items.length) enterChat();
   renderHistoryPage(r.items, !reset);
   refreshLoadMore();
@@ -1785,7 +1816,13 @@ es.onmessage = e => {
     case 'bg':             renderBg(m.bg || []); break;
     case 'tasks':          renderTasks(m.tasks || []); break;
     case 'workflow':       renderWorkflow(m.workflow); break;
-    case 'usage':          lastUsage = m; renderStat(); break;
+    case 'usage':
+      // 每次模型响应一条。prompt 不累加——它是"这次请求带了多少上下文"，
+      // 多轮之间大量重叠，加起来是个没有意义的大数（上下文占用看那个环）。
+      sumOut += m.completion || 0;
+      sumThink += m.reasoning || 0;
+      renderStat();
+      break;
     case 'bg_done':
       notice(`后台任务 #${m.id}${m.description ? '（' + m.description + '）' : ''} ${m.status}`
              + (m.exit_code != null ? `，退出码 ${m.exit_code}` : '')
@@ -1804,7 +1841,8 @@ es.onmessage = e => {
       if (!claimEcho(m.text)) userBubble(m.text, true);
       break;
     case 'resumed':
-      curSession = m.session; turns = 0; toolCalls = 0; lastUsage = null;
+      curSession = m.session; turns = 0; toolCalls = 0;
+      sumOut = 0; sumThink = 0;                        // 换会话，累计量一起清
       $('planbar').hidden = true; pendingPlan = '';      // 换会话先收掉旧的待批条
       // 上下文环显式清零。applyState 里是 `s.context_tokens || ctxUsed`——那个兜底是
       // 故意的（压缩后 context_tokens 会先归零、等下次请求才测出新值，期间推 0 会让环
@@ -1879,7 +1917,12 @@ async function send(){
   if (r.queued) node.classList.add('queued'); else setBusy(true);
 }
 $('send').onclick = send;
-$('stop').onclick = () => api('/api/interrupt');
+$('stop').onclick = () => {
+  if (stopping) return;             // 再点也只是重复置同一个标志位，不会更快
+  stopping = true;
+  setBusy(true);                    // 立刻重画成"正在停止"，别等服务端下一拍状态
+  api('/api/interrupt');
+};
 /** 锚定浮层：贴着 anchor 弹出。默认往上开（触发器都在底部输入框那一行），
     上方不够就翻到下面；左右夹在视口内，免得贴边时被切掉一半。 */
 function popover(anchor, html, onClick, minW){

@@ -36,7 +36,7 @@
 - **DeepSeek 纯答案回合回传 reasoning_content 会 400**,工具调用回合又必须带
 - 最终架构:**统一 `reasoning_content` 单载体 + "存全、发时过滤"**——思考无条件落盘(transcript 是完整事实),发送前由 provider 按各家档案浅拷贝过滤。切模型、来回切、跨模型续会话,CoT 无损且不 400
 
-实现:`registry.py`(ThinkingProfile 能力档案)+ `provider.py`(`_filter_reasoning` 发送闸)。
+实现:`registry.py`(ThinkingProfile 能力档案)+ `provider.py`(`_for_wire` 发送闸)。
 
 ### 2. 上下文压缩(对齐 Claude Code 的设计)
 
@@ -195,6 +195,6 @@ tests/          629 个单元/集成测试;tests/js/ 另有 216 条前端自检(
 
 这个项目的教材不止一份:主线是精读 Claude Code 的 Rust 重实现 ClawCode;配合抓取 Claude Code 本体的系统提示词做逐段对照、参考 51 万行泄露源码的多篇公开解读、并对 opencode / Codex 等同类 harness 做设计查证(edit 级联的替换器排序、skill 的"无使用中态"都来自这种交叉验证);模型侧的结论(思考链适配表)全部来自裸流探针逐家实测。方法是**边读边建**:读懂一块脊椎 → 用 Python 从零写出来 → 撞到问题再回去精读对应的加固。它不试图成为产品——它试图让你(和我)真正搞懂一个 coding agent 的内部是怎么转的。
 
-Roadmap 主线已收官:todo → 子代理 → 模式切换 → skill → workflow,外加思考链适配、edit 容错级联、联网工具、headless 入口。之后作者有时间还会继续完善。
+Roadmap 主线已收官:todo → 子代理 → 模式切换 → skill → workflow,外加思考链适配、edit 容错级联、联网工具、headless 入口。之后作者还会继续完善的。
 
-有项目或 agent 方面的想法和疑问,欢迎联系交流:**3178436095@qq.com**(QQ 号同邮箱)。作者是一名大二学生,暑假很闲的哈哈。
+有项目或 agent 方面的想法和疑问,欢迎联系交流,作者也是学生呢:**3178436095@qq.com**(QQ 号同邮箱)。

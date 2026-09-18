@@ -28,7 +28,7 @@ class ThinkingProfile:
     - reasoning_split：True → 发 `reasoning_split=True`，思考出独立字段而非 content 里的 `<think>`
         标签（MiniMax；它把同一份思考双发 reasoning_content + reasoning_details，我们统一只认前者）。
     - keep_reasoning：多轮里历史 assistant 的思考【发送时】带不带（存储永远全存，
-        见 provider._filter_reasoning）——
+        见 provider._for_wire）——
         ""           不带（未注册/老后端；也避免往不认识的服务端塞未知字段被拒）
         "all"        每一轮 assistant 都带（Kimi keep=all / MiniMax）
         "tool_calls" 只有【带工具调用】的 assistant 带，纯答案回合不带（DeepSeek/GLM）

@@ -182,7 +182,7 @@ class Agent:
                     "（下方历史里若提到某后台任务在运行，那是上次的、现已停止运行，不必去 check）。")})
             self.messages.extend(body)
             self._heal_orphans()   # 上次若被硬杀（关终端/崩溃）留下无结果的 tool_call → 补占位，免下次请求 400
-            # 跨模型 resume 不用洗历史思考：发送时 provider._filter_reasoning 按当前档案过滤（存全、发时过滤）
+            # 跨模型 resume 不用洗历史思考：发送时 provider._for_wire 按当前档案过滤（存全、发时过滤）
         elif system_prompt:
             # 新会话：system 只进 RAM、不写 transcript。它是"运行时配置"（每次启动由 build_system_prompt
             # 重生，含当前日期/cwd/环境），不是对话历史；压缩需要时仍会随 image 进 marker，不丢。
@@ -207,7 +207,7 @@ class Agent:
     def switch_backend(self, provider: Provider, config: AgentConfig | None = None) -> None:
         """热切后端（/config 保存后不重启即生效）：换 provider（连带新模型的思考档案），
         可选换 config（context_limit/compact_threshold 随新模型窗口重定）。
-        历史【不用清洗】：思考统一存 reasoning_content、发送时由 provider._filter_reasoning 按
+        历史【不用清洗】：思考统一存 reasoning_content、发送时由 provider._for_wire 按
         新档案过滤（"存全、发时过滤"）——切走再切回，CoT 无损。"""
         self.provider = provider
         if config is not None:
@@ -542,6 +542,7 @@ class Agent:
             text = ""                       # 本次模型输出的可见正文
             reasoning = ""                  # 本次模型的思考正文（统一 reasoning_content 载体，无条件落盘）
             tool_calls: list[ToolCall] = []  # 本次模型要调的工具
+            out_tok = think_tok = 0         # 本次响应的输出用量（落盘，供 UI 从 transcript 现数累计）
 
             # ① 调模型，消费 Provider 事件：思考/正文透传给上层，工具调用先收集
             try:
@@ -556,8 +557,12 @@ class Agent:
                             yield ev
                         case ToolCall():
                             tool_calls.append(ev)
-                        case Usage(prompt_tokens=pt):
+                        case Usage(prompt_tokens=pt, completion_tokens=ct, reasoning_tokens=rt):
                             self.context_tokens = pt   # 记下这次请求的精确上下文大小
+                            # 输出用量【跟着 assistant 消息落盘】：prompt 不存——它是"这次带了多少
+                            # 上下文"，多轮之间大量重叠，累加没有意义；completion 才是真实产出，
+                            # 累计它才能在刷新页面后仍然显示整个会话产出了多少（UI 从 transcript 现数）。
+                            out_tok, think_tok = ct, rt
                             yield ev                   # 透传：TUI 状态栏可实时显示 token
             except (KeyboardInterrupt, GeneratorExit, _TurnInterrupted):
                 raise                            # 打断有自己的出口（下方 except），别在这里插手
@@ -573,7 +578,8 @@ class Agent:
                 # tool_calls 传 []：provider 读完整个流才 flush ToolCall，半截调用根本到不了这里，
                 # 此时 tool_calls 本就是空的。
                 if text.strip():
-                    self._record(self._assistant_msg(text, [], reasoning=reasoning))
+                    self._record(self._assistant_msg(text, [], reasoning=reasoning,
+                                                     usage=(out_tok, think_tok)))
                 raise
 
             if self._interrupt.is_set():     # 流式被打断（provider 已提前停）→ 走统一打断处理
@@ -599,8 +605,9 @@ class Agent:
 
             # ② 把这轮的 assistant 消息记进对话（带上它要调的工具）。
             #    思考【无条件存】（"存全、发时过滤"）：transcript 是完整事实，切模型/来回切 CoT 不丢；
-            #    该不该带给当前模型（keep_reasoning 作用域）由 provider._filter_reasoning 在发送时决定。
-            self._record(self._assistant_msg(text, tool_calls, reasoning=reasoning))
+            #    该不该带给当前模型（keep_reasoning 作用域）由 provider._for_wire 在发送时决定。
+            self._record(self._assistant_msg(text, tool_calls, reasoning=reasoning,
+                                             usage=(out_tok, think_tok)))
 
             # ③ 没有工具调用 → 模型给了最终答案 → 本轮结束
             if not tool_calls:
@@ -789,13 +796,20 @@ class Agent:
         return "" if self._interrupt.is_set() else "".join(parts)
 
     @staticmethod
-    def _assistant_msg(text: str, tool_calls: list[ToolCall], reasoning: str = "") -> dict:
+    def _assistant_msg(text: str, tool_calls: list[ToolCall], reasoning: str = "",
+                       usage: tuple[int, int] = (0, 0)) -> dict:
         """把 ToolCall 事件还原成 OpenAI 格式的 assistant 消息。
         关键：发回去时 arguments 必须是【字符串】(json.dumps)，不是 dict。
-        思考统一存 reasoning_content 纯文本（四家通用载体，MiniMax 也收）；空 → 不带思考字段。"""
+        思考统一存 reasoning_content 纯文本（四家通用载体，MiniMax 也收）；空 → 不带思考字段。
+
+        usage=(completion, reasoning) 是【mecode 自己的字段，不是 API 的】——落进 transcript
+        供事后累计（UI 刷新后仍能显示整个会话产出了多少）。它必须在发送前剥掉，
+        由 provider._for_wire 负责；加新的内部字段记得同步那份名单。"""
         msg: dict = {"role": "assistant", "content": text or ""}
         if reasoning:
             msg["reasoning_content"] = reasoning
+        if usage[0] or usage[1]:
+            msg["usage"] = {"completion": usage[0], "reasoning": usage[1]}
         if tool_calls:
             msg["tool_calls"] = [
                 {

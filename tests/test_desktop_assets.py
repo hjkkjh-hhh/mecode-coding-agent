@@ -275,8 +275,17 @@ def test_统计行每段各裹一个_span(html):
     """.statline 是 flex 容器，直接放进去的裸文字会被包成匿名 flex 项——
     "2" 和 "轮" 成了两个项，一 wrap 就一行一个字竖着排下来（和字标被 gap 拆开同一个坑）。"""
     assert "<span><b>${turns}</b> 轮</span>" in html, "统计行的段没裹 span"
-    assert "<span>输出 <b>${lastUsage.completion}</b> tok" in html
+    assert "<span>输出 <b>${sumOut.toLocaleString()}</b> tok" in html
     assert "</span>`);" in html, "输出那段没闭合 span"
+
+
+def test_统计行三个数同口径(html):
+    """轮数/工具次数是【累计】的，token 也必须是——原来它取的是最后一次响应的 completion，
+    "17 次工具 | 输出 237 tok" 会让人以为这一整轮才产出 237 个 token。
+    累计值由服务端从 transcript 现数、reset 时灌进来（见 Desk.history 的 out_tokens）。"""
+    assert "sumOut = r.out_tokens || 0" in html, "刷新后没从 transcript 灌累计值，会从 0 重新数"
+    assert "sumOut += m.completion || 0" in html, "usage 事件没累加"
+    assert "lastUsage" not in html, "还留着「只取最后一次」的旧变量"
 
 
 def test_回显必须先于请求(html):

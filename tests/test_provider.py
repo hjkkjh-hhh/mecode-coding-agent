@@ -203,7 +203,7 @@ def test_minimax_双发两字段_只认content_不重复显示():
     assert any(isinstance(e, TextDelta) and e.text == "ans" for e in evs)   # content 是纯答案
 
 
-# ---- 发送闸 _filter_reasoning（"存全、发时过滤"）----
+# ---- 发送闸 _for_wire（"存全、发时过滤"）----
 
 def _mk(model):
     return Provider(Backend(base_url="http://t/v1", model=model, api_key="k"))
@@ -217,12 +217,12 @@ _HISTORY = [
 
 
 def test_filter_all档案_每轮都带(monkeypatch):
-    out = _mk("kimi-k2.7-code")._filter_reasoning(_HISTORY)
+    out = _mk("kimi-k2.7-code")._for_wire(_HISTORY)
     assert out[1]["reasoning_content"] == "想1" and out[2]["reasoning_content"] == "想2"
 
 
 def test_filter_tool_calls档案_纯答案回合剥掉():
-    out = _mk("deepseek-v4-flash")._filter_reasoning(_HISTORY)
+    out = _mk("deepseek-v4-flash")._for_wire(_HISTORY)
     assert "reasoning_content" not in out[1]              # 纯答案回合不带（带了 400）
     assert out[2]["reasoning_content"] == "想2"           # 工具回合带
 
@@ -232,7 +232,7 @@ def test_filter_未知模型_默认按工具回合带_且不改原消息(tmp_pat
     不存在发错字段的风险（它没发，历史里就没有）。与"不发 thinking 参数"是两件事。"""
     import mecode.config as cfg
     monkeypatch.setattr(cfg, "USER_CONFIG_PATH", tmp_path / "config.json")   # 隔离：会查真实 config
-    out = _mk("未注册模型")._filter_reasoning(_HISTORY)
+    out = _mk("未注册模型")._for_wire(_HISTORY)
     assert "reasoning_content" not in out[1]             # 纯答案回合仍剥掉
     assert out[2]["reasoning_content"] == "想2"          # 工具回合带回去
     assert _HISTORY[1]["reasoning_content"] == "想1"      # 原消息无损（浅拷贝，历史不被改写）
@@ -248,13 +248,44 @@ def test_filter_未知模型_显式关掉走none哨兵(tmp_path, monkeypatch):
     monkeypatch.setattr(cfg, "USER_CONFIG_PATH", p)
     p.write_text(json.dumps({"keep_reasoning": "none"}), encoding="utf-8")
     pv = _mk("未注册模型")
-    assert all("reasoning_content" not in m for m in pv._filter_reasoning(_HISTORY)
+    assert all("reasoning_content" not in m for m in pv._for_wire(_HISTORY)
                if m["role"] == "assistant")
     # 哨兵要【归一化成 ""】而不是原样留着：留着的话行为虽然碰巧一样（未知 scope 也是全剥），
     # 但别处读 profile.keep_reasoning 会显示成 "none"（如 /config 的"思维链保留：{x or '不保留'}"）
     assert pv.profile.keep_reasoning == ""
     p.write_text(json.dumps({"keep_reasoning": ""}), encoding="utf-8")       # 老配置的空串 = 没设过
-    assert _mk("未注册模型")._filter_reasoning(_HISTORY)[2]["reasoning_content"] == "想2"
+    assert _mk("未注册模型")._for_wire(_HISTORY)[2]["reasoning_content"] == "想2"
+
+
+# ---- 内部字段：只存不发 ----
+
+_WITH_USAGE = [
+    {"role": "user", "content": "问"},
+    # 只带 usage、不带 reasoning_content：光按"有没有思考"分支的话会整条原样放过去
+    {"role": "assistant", "content": "答", "usage": {"completion": 868, "reasoning": 842}},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}],
+     "reasoning_content": "想", "usage": {"completion": 20, "reasoning": 0}},
+]
+
+
+def test_内部字段usage发送前剥掉(tmp_path, monkeypatch):
+    """usage 是 mecode 自己记的（供 UI 从 transcript 累计），不是 OpenAI 的字段。
+    留在消息里会随每个请求发出去，严格的后端见到不认识的键会 400。"""
+    import mecode.config as cfg
+    monkeypatch.setattr(cfg, "USER_CONFIG_PATH", tmp_path / "config.json")
+    out = _mk("未注册模型")._for_wire(_WITH_USAGE)
+    assert all("usage" not in m for m in out), "usage 必须在发送前剥掉"
+    assert out[2]["reasoning_content"] == "想"            # 剥 usage 不能顺手把思考也剥了
+    assert out[1]["content"] == "答"                      # 别的字段一个不少
+    # 原消息无损：transcript 和 live messages 里那份必须还带着 usage，不然累计就没了
+    assert _WITH_USAGE[1]["usage"]["completion"] == 868
+
+
+def test_内部字段与思考过滤互不干扰(tmp_path, monkeypatch):
+    """keep_reasoning="all" 时思考全留，但 usage 照样要剥——两条闸各管各的。"""
+    out = _mk("kimi-k2.7-code")._for_wire(_WITH_USAGE)
+    assert all("usage" not in m for m in out)
+    assert out[2]["reasoning_content"] == "想"
 
 
 

@@ -24,6 +24,12 @@ from .registry import ThinkingProfile, context_window_for, profile_for
 # 可重试的瞬时 HTTP 状态：限流 + 网关/服务端临时错误
 _RETRIABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
+# 只存不发的【mecode 自有字段】：transcript 里带着，发送前由 _for_wire 剥掉。
+#   usage —— 每条 assistant 响应的输出用量（agent._assistant_msg 写入），
+#            存下来 UI 才能刷新后仍累计出整个会话产出了多少 token。
+# 加新的内部字段【必须】同步这里，否则会随消息发给后端（严格的后端见到不认识的键会 400）。
+_INTERNAL_KEYS = frozenset({"usage"})
+
 
 class ProviderError(Exception):
     """后端请求失败的【人话】版本（4xx/重试用尽的 5xx/连不上）。
@@ -119,23 +125,32 @@ class Provider:
             out["reasoning_split"] = True
         return out
 
-    def _filter_reasoning(self, messages: list[dict]) -> list[dict]:
-        """发送前按【自家档案】过滤历史思考——"存全、发时过滤"的发送闸。
-        存储层无条件存 reasoning_content（见 agent._turn_loop），这里决定每条 assistant 带不带：
-        keep_reasoning："all"=每轮带 / "tool_calls"=只带工具调用的回合带 / ""=全不带。
-        载体统一 reasoning_content（DeepSeek 首创的事实标准，vLLM/GLM/Kimi 通行；MiniMax 双发也收它——
-        官方 Thinking Control 有背书 + 回传实测 200）。
-        浅拷贝该改的消息，live messages / transcript 永不被改——切模型不丢 CoT。"""
+    def _for_wire(self, messages: list[dict]) -> list[dict]:
+        """发送前把消息整理成能上线的样子。两件事：
+
+        ① 按【自家档案】过滤历史思考——"存全、发时过滤"的发送闸。
+           存储层无条件存 reasoning_content（见 agent._turn_loop），这里决定每条 assistant 带不带：
+           keep_reasoning："all"=每轮带 / "tool_calls"=只带工具调用的回合带 / ""=全不带。
+           载体统一 reasoning_content（DeepSeek 首创的事实标准，vLLM/GLM/Kimi 通行；MiniMax 双发也收它——
+           官方 Thinking Control 有背书 + 回传实测 200）。
+        ② 剥掉【mecode 自己的字段】（_INTERNAL_KEYS）。transcript 是完整事实、可以带私货，
+           但发出去的必须是干净的 OpenAI 消息——严格的后端见到不认识的键会 400。
+
+        浅拷贝该改的消息，live messages / transcript 永不被改——切模型不丢 CoT、不丢用量。"""
         scope = self.profile.keep_reasoning
         out = []
         for m in messages:
-            if m.get("role") != "assistant" or "reasoning_content" not in m:
+            drop = _INTERNAL_KEYS & m.keys()
+            if m.get("role") != "assistant" or ("reasoning_content" not in m and not drop):
                 out.append(m)
                 continue
             keep = scope == "all" or (scope == "tool_calls" and bool(m.get("tool_calls")))
-            if not keep:
+            if not keep or drop:
                 m = dict(m)
-                m.pop("reasoning_content")
+                if not keep:
+                    m.pop("reasoning_content", None)
+                for k in drop:
+                    m.pop(k, None)
             out.append(m)
         return out
 
@@ -150,7 +165,7 @@ class Provider:
         should_stop: 协作式打断回调，返回 True 就停止消费（上层置位、流式中途停下）。"""
         payload: dict = {
             "model": self.backend.model,
-            "messages": self._filter_reasoning(messages),
+            "messages": self._for_wire(messages),
             "stream": True,
             "stream_options": {"include_usage": True},   # 流式末尾带 token 用量
         }

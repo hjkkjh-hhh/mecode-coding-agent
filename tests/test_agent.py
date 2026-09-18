@@ -198,7 +198,7 @@ def test_下一轮_无pending不插marker(tmp_path):
     assert "新指令" in contents
 
 
-# ---- 思考存储：无条件存（"存全、发时过滤"——该不该发给当前模型由 provider._filter_reasoning 决定）----
+# ---- 思考存储：无条件存（"存全、发时过滤"——该不该发给当前模型由 provider._for_wire 决定）----
 
 class _ReasoningProvider:
     """回一段思考 + 正文。"""
@@ -344,7 +344,7 @@ def test_clip_offload_头尾两模式(tmp_path):
 
 def test_switch_backend_历史不被改写_切回CoT无损(tmp_path):
     """热切后端【不清洗历史】（"存全、发时过滤"）：live messages 原样保留，
-    该不该发给新模型由 provider._filter_reasoning 在发送时决定。切走再切回，CoT 完整。"""
+    该不该发给新模型由 provider._for_wire 在发送时决定。切走再切回，CoT 完整。"""
     a = _agent(tmp_path)
     history = [
         {"role": "assistant", "content": "答A", "reasoning_content": "想A"},
@@ -607,3 +607,59 @@ def test_压缩中途能停下_且不留半截摘要(tmp_path):
     assert a.messages == before, "被打断却还是把（半截）摘要顶上去了"
     assert any("取消压缩" in getattr(e, "text", "") for e in evs), \
         "打断后没告诉用户，看起来像点了停止没反应"
+
+
+# ---- 输出用量：跟着 assistant 消息落盘（只存不发，供 UI 从 transcript 累计）----
+
+class _UsageProvider:
+    """两轮：调一次工具再收尾，各带一条 Usage。"""
+    profile = INERT
+
+    def __init__(self):
+        self.calls = 0
+
+    def stream(self, messages, tools=None, should_stop=None):
+        self.calls += 1
+        if self.calls == 1:
+            yield ReasoningDelta("想")
+            yield ToolCall(id="c1", name="noop", arguments={})
+            yield Usage(prompt_tokens=100, completion_tokens=30,
+                        total_tokens=130, reasoning_tokens=25)
+            yield Done(reason="tool_calls")
+        else:
+            yield TextDelta("好了")
+            yield Usage(prompt_tokens=200, completion_tokens=868,
+                        total_tokens=1068, reasoning_tokens=842)
+            yield Done(reason="stop")
+
+
+def test_用量跟着assistant消息存(tmp_path):
+    """每条 assistant 记下【自己那次响应】的用量，累加才是整个会话的真实产出。
+    prompt 不存：多轮之间大量重叠，累加没有意义（上下文占用另有其数）。"""
+    reg = default_registry()
+    reg.register(Tool("noop", "空工具", {"type": "object", "properties": {}}, lambda a: "ok"))
+    a = Agent(_UsageProvider(), reg, system_prompt="你是助手")
+    list(a.run_turn("问"))
+    asst = [m for m in a.messages if m["role"] == "assistant"]
+    assert [m["usage"] for m in asst] == [
+        {"completion": 30, "reasoning": 25},
+        {"completion": 868, "reasoning": 842},
+    ]
+    assert sum(m["usage"]["completion"] for m in asst) == 898
+    assert "prompt" not in asst[0]["usage"]
+
+
+def test_没有usage事件时不写空字段():
+    """老后端/不返回 usage 的情况：不写这个字段，而不是写一堆 0——
+    0 和"没测到"在累计里是一回事，但空字段会让 transcript 多出一堆噪声。"""
+    class _NoUsage:
+        profile = INERT
+
+        def stream(self, messages, tools=None, should_stop=None):
+            yield TextDelta("答")
+            yield Done(reason="stop")
+
+    a = Agent(_NoUsage(), default_registry(), system_prompt="你是助手")
+    list(a.run_turn("问"))
+    asst = [m for m in a.messages if m["role"] == "assistant"][-1]
+    assert "usage" not in asst

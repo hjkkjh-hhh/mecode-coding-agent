@@ -1261,6 +1261,16 @@ class Desk:
         turns = sum(1 for m in msgs if m.get("role") == "user"
                     and not str(m.get("content") or "").startswith("<system-reminder>"))
         ncalls = sum(len(m.get("tool_calls") or []) for m in msgs)
+        # 输出用量同理【从 transcript 现数】——agent._assistant_msg 把每次响应的
+        # {completion, reasoning} 记在 assistant 消息的 usage 字段里（只存不发，
+        # provider._for_wire 发送前剥掉）。老会话没这个字段，缺省 0，不报错。
+        # prompt 不累计：那是"这次带了多少上下文"，多轮之间大量重叠，加起来没有意义。
+        out_tok = think_tok = 0
+        for m in msgs:
+            u = m.get("usage")
+            if isinstance(u, dict):
+                out_tok += int(u.get("completion") or 0)
+                think_tok += int(u.get("reasoning") or 0)
         end = max(0, total - before)
         start = max(0, end - limit)
         items = []
@@ -1284,6 +1294,7 @@ class Desk:
                 items.append({"seq": i, "role": "tool", "text": str(text)[:2000],
                               "tool_call_id": m.get("tool_call_id")})
         return {"items": items, "total": total, "turns": turns, "tool_calls": ncalls,
+                "out_tokens": out_tok, "think_tokens": think_tok,
                 "next_before": before + (end - start) if start > 0 else 0}
 
     def _swap_agent(self, store: SessionStore, meta: dict | None) -> None:

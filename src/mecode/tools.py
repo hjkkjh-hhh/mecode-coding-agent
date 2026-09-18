@@ -528,6 +528,8 @@ def _bash(args: dict, slot: "ProcSlot | None" = None,
     if slot is not None:
         slot.register(proc)            # 登记前台进程：外部（UI 线程）可据此直接 kill
     try:
+        if slot is not None and slot.stop_requested():
+            slot.kill()
         out_b, err_b = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
