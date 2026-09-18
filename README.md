@@ -1,4 +1,4 @@
-# mecode
+# mecode — A Readable Coding Agent Harness
 
 ![tests](https://img.shields.io/badge/tests-629_pytest_%2B_216_js-brightgreen)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
