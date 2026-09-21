@@ -42,7 +42,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from mecode.bootstrap import build_agent          # noqa: E402
 from mecode.compact import estimate_tokens        # noqa: E402
-from mecode.events import Notice, ReasoningDelta, TextDelta, ToolResult, ToolStarted  # noqa: E402
+from mecode.events import Notice, ReasoningDelta, Retrying, TextDelta, ToolResult, ToolStarted  # noqa: E402
 from serve_zq import debate_meta, debate_tools, lean_system  # noqa: E402(证券辩论专属适配包)
 
 _PERSONA_HEADER = "\n\n===== 以下为调用方为本次对话设定的角色与任务(务必遵循) =====\n"
@@ -307,8 +307,10 @@ def _run_and_capture(agent, user_input: str, emit=None) -> tuple[str, str]:
     工具起止、系统提示;不参与最终正文折叠,权威正文仍走返回值。"""
     deltas: list[str] = []
     rdeltas: list[str] = []
+    reasoning_start = 0  # 当前尚未交付正文/工具的请求在 rdeltas 中的起点
     for ev in agent.run_turn(user_input):
         if isinstance(ev, TextDelta):
+            reasoning_start = len(rdeltas)
             deltas.append(ev.text)
             if emit:
                 emit({"kind": "text", "delta": ev.text})
@@ -317,6 +319,7 @@ def _run_and_capture(agent, user_input: str, emit=None) -> tuple[str, str]:
             if emit:
                 emit({"kind": "reasoning", "delta": ev.text})
         elif isinstance(ev, ToolStarted):
+            reasoning_start = len(rdeltas)
             if emit:
                 try:
                     _args = json.dumps(ev.arguments, ensure_ascii=False)
@@ -328,6 +331,11 @@ def _run_and_capture(agent, user_input: str, emit=None) -> tuple[str, str]:
                 _r = ev.result or ""
                 emit({"kind": "tool_done", "id": ev.id, "name": ev.name,
                       "preview": _r[:200], "chars": len(_r)})
+        elif isinstance(ev, Retrying):
+            del rdeltas[reasoning_start:]
+            if emit:
+                emit({"kind": "retrying", "text": ev.text, "attempt": ev.attempt,
+                      "max_retries": ev.max_retries, "delay": ev.delay})
         elif isinstance(ev, Notice):          # 压缩/达上限/空响应等系统提示:网关调用里外界原本无感知
             print(f"[serve] Notice: {ev.text}")
             if emit:

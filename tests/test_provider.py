@@ -1,4 +1,4 @@
-"""Provider 的重试退避：瞬时错误（429/5xx/连接错）退避重试，4xx 直接抛，流中途不重试。
+"""Provider 的重试退避：瞬时错误退避重试，4xx 直接抛，交付正文/工具后不重试。
 
 用 httpx.MockTransport 注入"前 N 次失败、之后成功"的假后端，不联网。
 """
@@ -298,14 +298,15 @@ def test_未知模型_payload不带thinking():
 
 
 def test_should_stop_提前停止():
-    # should_stop 第 2 次返回 True → 在消费中途停下，不再 yield 后续、也没到 [DONE]
-    calls = {"n": 0}
-    def stop():
-        calls["n"] += 1
-        return calls["n"] >= 2
+    # 收到正文后主动停止；不依赖实现里检查回调的次数。
+    import threading
+    stop = threading.Event()
     p = _provider(lambda req: httpx.Response(200, content=_SSE_OK))
-    evs = list(p.stream([{"role": "user", "content": "hi"}], should_stop=stop))
-    assert any(isinstance(e, TextDelta) for e in evs)   # 收到了开头的正文
+    gen = p.stream([{"role": "user", "content": "hi"}], should_stop=stop.is_set)
+    first = next(gen)
+    assert isinstance(first, TextDelta)
+    stop.set()
+    evs = list(gen)
     assert not any(isinstance(e, Done) for e in evs)    # 提前停 → 没有 Done
 
 

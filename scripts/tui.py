@@ -51,7 +51,7 @@ from mecode.config import (                              # noqa: E402
     saved_configs, update_settings,
 )
 from mecode.events import (                              # noqa: E402
-    Notice, PlanProposed, ReasoningDelta, TextDelta, ToolResult, ToolStarted, Usage,
+    Notice, PlanProposed, ReasoningDelta, Retrying, TextDelta, ToolResult, ToolStarted, Usage,
 )
 from mecode.mcp import (                                 # noqa: E402
     connect_servers, cycle_server_timeout, default_config_paths, load_mcp_config,
@@ -3753,6 +3753,13 @@ class MecodeApp(App):
             self._start_bg_turn()                     # 收尾时若有后台完成待处理 → 接着自动起一轮
             return
         match ev:
+            case Retrying():
+                self._reasoning = ""
+                self._reasoning_end = 0.0
+                self._think_start = time.monotonic() + ev.delay
+                self._live_dirty = True
+                self._set_activity("等待重试")
+                self._mount(Static(Text(f"（{ev.text}）", style="yellow")), batch=False)
             case ReasoningDelta(text=t):
                 self._reasoning += t
                 self._reasoning_end = time.monotonic()  # 末片时刻随片更新

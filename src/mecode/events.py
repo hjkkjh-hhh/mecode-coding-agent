@@ -51,6 +51,23 @@ class Usage:
     reasoning_tokens: int = 0
 
 
+@dataclass
+class Retrying:
+    """当前请求尚未交付正文/工具调用，丢弃本次思考后退避重试。
+
+    attempt 从 1 开始，表示接下来是第几次重试（不含首次请求）。
+    只清理当前请求的临时内容，不撤销已完成的模型回合、工具结果或已报告的用量。
+    """
+    attempt: int
+    max_retries: int
+    delay: float
+    reason: str
+
+    @property
+    def text(self) -> str:
+        return f"{self.reason}，{self.delay:g} 秒后重试（{self.attempt}/{self.max_retries}）"
+
+
 # 下面三个是 Agent 层产出的事件（Provider 不产出），供上层显示工具执行与提示。
 @dataclass
 class ToolStarted:
@@ -84,9 +101,9 @@ class PlanProposed:
     path: str | None = None
 
 
-# 方便类型标注：Provider.stream() 产出 ReasoningDelta/TextDelta/ToolCall/Done/Usage；
+# 方便类型标注：Provider.stream() 产出 ReasoningDelta/TextDelta/ToolCall/Done/Usage/Retrying；
 # Agent.run_turn() 还会产出 ToolStarted/ToolResult/Notice/PlanProposed。
 Event = (
-    ReasoningDelta | TextDelta | ToolCall | Done | Usage
+    ReasoningDelta | TextDelta | ToolCall | Done | Usage | Retrying
     | ToolStarted | ToolResult | Notice | PlanProposed
 )

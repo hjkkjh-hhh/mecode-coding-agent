@@ -102,7 +102,7 @@ from mecode.config import (                                               # noqa
     saved_configs, update_settings,
 )
 from mecode.events import (                                               # noqa: E402
-    Done, Notice, PlanProposed, ReasoningDelta, TextDelta,
+    Done, Notice, PlanProposed, ReasoningDelta, Retrying, TextDelta,
     ToolCall, ToolResult, ToolStarted, Usage,
 )
 from mecode.mcp import (                                                  # noqa: E402
@@ -170,6 +170,9 @@ def encode(ev) -> dict | None:
         return {"type": "text", "text": ev.text}
     if isinstance(ev, ReasoningDelta):
         return {"type": "reasoning", "text": ev.text}
+    if isinstance(ev, Retrying):
+        return {"type": "retrying", "text": ev.text, "attempt": ev.attempt,
+                "max_retries": ev.max_retries, "delay": ev.delay}
     if isinstance(ev, ToolStarted):
         return {"type": "tool_start", "id": ev.id, "name": ev.name, "args": ev.arguments}
     if isinstance(ev, ToolResult):

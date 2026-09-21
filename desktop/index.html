@@ -954,6 +954,7 @@ const get = p => fetch(p, {headers:{'X-Mecode-Token':TOKEN}})
   .then(r => r.json()).catch(() => ({error:'请求失败'}));
 
 let busy = false, stopping = false, live = null, liveKind = null, curSession = '';
+let pendingReasoning = []; // 当前请求的思考节点；交付正文/工具后即不再属于可重试内容
 let histBefore = 0, histTotal = 0, ctxLimit = 0, ctxUsed = 0, compactAt = 0;
 
 /* 本地已经乐观渲染、还等着对应 SSE 事件来认领的用户消息。
@@ -1035,6 +1036,7 @@ function paintMd(el, now){
 }
 
 function stream(kind, text){
+  if (kind === 'text') pendingReasoning = [];
   const stick = atBottom();
   if (liveKind !== kind) {
     const d = msg('bot');
@@ -1048,6 +1050,7 @@ function stream(kind, text){
       acts.appendChild(copyBtn(() => node._raw));      // 复制给【原文】，不是渲染后的字
       d.appendChild(acts);
     } else {
+      pendingReasoning.push(d);
       const t = document.createElement('details'); t.className = 'think';
       t.innerHTML = '<summary><span class="lbl">Think</span><span class="peek"></span></summary>'
                   + '<div class="full"></div>';
@@ -1062,6 +1065,14 @@ function stream(kind, text){
     if (live._peek) live._peek.textContent = '· ' + live.textContent.slice(-160).replace(/\s+/g, ' ');
   }
   if (stick) scroll();
+}
+
+function retrying(m){
+  // 可能夹过后台通知，把同一次失败请求的所有思考节点都移除，保留已完成回合。
+  pendingReasoning.forEach(d => d.remove());
+  pendingReasoning = [];
+  live = null; liveKind = null;
+  notice(m.text);
 }
 
 /* 工具图标：按【它干什么】分类，不是一个工具一个图，
@@ -1185,6 +1196,7 @@ function toolNode(name, args){
   return d;
 }
 function toolStart(m){
+  pendingReasoning = [];
   const stick = atBottom();
   const d = toolNode(m.name, m.args);
   msg('bot').appendChild(d);
@@ -1733,7 +1745,7 @@ function renderHistoryPage(items, prepend){
 let loadingMore = false;
 
 async function loadHistory(reset){
-  if (reset) { col.innerHTML = ''; histBefore = 0; toolBox.clear(); liveKind = null; }
+  if (reset) { col.innerHTML = ''; histBefore = 0; toolBox.clear(); liveKind = null; pendingReasoning = []; }
   const m = $('main');
   const h0 = m.scrollHeight, t0 = m.scrollTop;     // 前插会把已有内容整体往下推
   const r = await get(`/api/history?before=${histBefore}`);
@@ -1806,6 +1818,7 @@ es.onmessage = e => {
     case 'state':          applyState(m); break;
     case 'text':           stream('text', m.text); break;
     case 'reasoning':      stream('reasoning', m.text); break;
+    case 'retrying':       retrying(m); break;
     case 'tool_start':     toolStart(m); break;
     case 'tool_result':    toolResult(m); break;
     case 'notice':         notice(m.text); break;
@@ -1829,6 +1842,7 @@ es.onmessage = e => {
              + (m.output ? '：' + m.output.slice(0, 300) : ''));
       break;
     case 'turn_start':
+      pendingReasoning = [];
       // 用户消息由【发起的那个标签页】本地回显（体感更快），其余标签页照着这条渲——
       // 不然在 B 标签页看不到 A 标签页刚发的话，对话就断了。
       setBusy(true); turns++; renderStat();
@@ -1855,7 +1869,7 @@ es.onmessage = e => {
     case 'turn_end':
       // 节流可能正压着最后一帧没画；这里无条件定稿一次，否则末尾几个字要等 66ms 才出来
       if (live && live._raw != null && liveKind === 'text') paintMd(live, true);
-      liveKind = null; setBusy(false);
+      liveKind = null; pendingReasoning = []; setBusy(false);
       if (m.context_tokens) ctxUsed = m.context_tokens;
       renderStat();
       break;

@@ -78,7 +78,7 @@ def test_有usage时不走估算(tmp_path):
     assert any(m.get("content") == "旧问题" * 2000 for m in a.messages)  # 没被压
 
 
-# ---- Ctrl-C 打断回滚 ----
+# ---- Ctrl-C 打断：保留正文并立即记录中断 ----
 
 class _InterruptProvider:
     """流到一半抛 KeyboardInterrupt，模拟用户 Ctrl-C。"""
@@ -99,22 +99,27 @@ def _agent_with(provider, tmp):
     return Agent(provider, default_registry(), system_prompt="你是助手")
 
 
-def test_流式打断_保留user_需独立标记(tmp_path):
-    # 流式被打断（无工具）：user 保留（不回滚）、置 pending（下轮需单独插标记）、产出 Notice
+def test_流式打断_保留正文并立即记录中断(tmp_path):
     a = _agent_with(_InterruptProvider(), tmp_path)
     evs = list(a.run_turn("我的问题"))
     assert any(m.get("content") == "我的问题" for m in a.messages)      # 保留，不回滚
-    assert a._pending_interrupt_marker is True
+    assert a.messages[-2:] == [
+        {"role": "assistant", "content": "思考"},
+        {"role": "user", "content": "[Request interrupted by user]"},
+    ]
     assert any(isinstance(e, Notice) and "打断" in e.text for e in evs)
 
 
-def test_close也置pending并保留(tmp_path):
+def test_close也保留正文并立即记录中断(tmp_path):
     a = _agent_with(_SlowProvider(), tmp_path)
     gen = a.run_turn("我的问题")
     next(gen)                                            # user 已 append、循环挂起
     gen.close()                                          # 模拟 render 中途被打断
     assert any(m.get("content") == "我的问题" for m in a.messages)      # 保留
-    assert a._pending_interrupt_marker is True
+    assert a.messages[-2:] == [
+        {"role": "assistant", "content": "a"},
+        {"role": "user", "content": "[Request interrupted by user]"},
+    ]
 
 
 def test_fill补齐缺失工具结果_返回True(tmp_path):
@@ -179,19 +184,18 @@ def test_heal_orphans_不碰已答且幂等(tmp_path):
     assert len(a.messages) == n                           # 再跑一次不重复补
 
 
-def test_下一轮_pending时插独立marker(tmp_path):
-    a = _agent_with(_SlowProvider(), tmp_path)
-    a._pending_interrupt_marker = True
+def test_下一轮不重复插入中断marker(tmp_path):
+    a = _agent_with(_InterruptProvider(), tmp_path)
+    list(a.run_turn("旧问题"))
+    a.provider = _SlowProvider()
     list(a.run_turn("新指令"))
     contents = [m["content"] for m in a.messages if m.get("role") == "user"]
-    assert "[Request interrupted by user]" in contents                # 单独一条
+    assert contents.count("[Request interrupted by user]") == 1
     assert "新指令" in contents                                       # 新输入是另一条
-    assert a._pending_interrupt_marker is False                       # 已清
 
 
-def test_下一轮_无pending不插marker(tmp_path):
+def test_正常轮次不插marker(tmp_path):
     a = _agent_with(_SlowProvider(), tmp_path)
-    a._pending_interrupt_marker = False                                # 工具打断那种：标记已在 tool 结果里
     list(a.run_turn("新指令"))
     contents = [m["content"] for m in a.messages if m.get("role") == "user"]
     assert "[Request interrupted by user]" not in contents            # 不重复插
@@ -276,9 +280,11 @@ def test_request_interrupt_流式中打断(tmp_path):
     a = _agent_with(p, tmp_path)
     p.agent = a
     evs = list(a.run_turn("问题"))
-    assert a._pending_interrupt_marker is True                         # 流式打断 → 需独立标记
     assert any(isinstance(e, Notice) and "打断" in e.text for e in evs)
-    assert a.messages[-1]["content"] == "问题"                         # assistant 未 append，末尾仍是 user
+    assert a.messages[-2:] == [
+        {"role": "assistant", "content": "部分回答"},
+        {"role": "user", "content": "[Request interrupted by user]"},
+    ]
 
 
 def test_每轮开头清打断标志(tmp_path):

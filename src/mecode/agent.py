@@ -25,7 +25,7 @@ from .subagent import SubagentRunner, subagent_tools
 from .tasks import TaskManager, task_tools
 from .config import AgentConfig, agent_config
 from .events import (
-    Done, Event, Notice, PlanProposed, ReasoningDelta, TextDelta, ToolCall, ToolResult,
+    Done, Event, Notice, PlanProposed, ReasoningDelta, Retrying, TextDelta, ToolCall, ToolResult,
     ToolStarted, Usage,
 )
 from .permission import ALLOW, ALWAYS, ASK, DENY, PermissionPolicy
@@ -128,7 +128,6 @@ class Agent:
         # 自带翻页的"read 类"工具名：其超长输出不外置（模型本就能用 offset/limit 翻，外置反绕圈）
         self._read_tool_names = {t.strip() for t in config.rescue_read_tools.split(",") if t.strip()}
         self.context_tokens = 0          # 上次请求返回的精确 prompt_tokens（上下文大小）
-        self._pending_interrupt_marker = False   # 下轮是否需单独插一条 [Request interrupted by user]
         # 协作式打断标志（TUI 在另一线程置位，本线程轮询）。可【注入共享】：子 agent 复用主 agent 的同一个，
         # 这样 Ctrl+C 能连带停子 agent（在其下一个检查点）。不注入则自建一个（主 agent / 测试）。
         self._interrupt = interrupt if interrupt is not None else threading.Event()
@@ -251,7 +250,7 @@ class Agent:
         """跑一整轮，把过程作为事件流产出（不负责显示）。
         产出的事件：ReasoningDelta/TextDelta（透传模型输出）、
         ToolStarted/ToolResult（工具执行）、Notice（加固提示）。"""
-        yield from self._pre_turn()                  # 清打断标志 +（满了就）压缩 + 补上一轮打断标记
+        yield from self._pre_turn()                  # 清打断标志 +（满了就）压缩
         self._record({"role": "user", "content": user_input})
         if self.store is not None:
             # 会话头：首轮设标题、每轮刷新 updated_at + 落当前模式（resume 恢复），供 /rl /rs 列会话挑选
@@ -339,12 +338,6 @@ class Agent:
         self._interrupt.clear()
         # 加固④：上下文压缩 —— 在追加本轮内容【之前】压一次。旧历史交给摘要承载，本轮新内容随后原样追加。
         yield from self._maybe_compact()
-        # 上一轮的打断若没在上下文留下标记（流式被打断、或工具批已全完成后才被打断）→ 单独插一条
-        # [Request interrupted by user]，让模型知道上一步被打断；工具执行中途被打断时，补齐的 tool
-        # 结果里已带该标记，就不再重复插。
-        if self._pending_interrupt_marker:
-            self._record({"role": "user", "content": "[Request interrupted by user]"})
-            self._pending_interrupt_marker = False
         self._inject_mode_reminder()     # 模式行为提示词（plan/yolo）：每轮注入到压缩之后、本轮内容之前（最新消息处）
         if self._pending_reminder:       # 一次性 reminder（如批准计划的执行提示）：注入一次即清，不显示成用户消息
             self._record({"role": "user", "content": _reminder(self._pending_reminder)})
@@ -376,17 +369,25 @@ class Agent:
         return False
 
     def _run_loop_guarded(self) -> Iterator[Event]:
-        """跑 _turn_loop，包在 try 里支持 Ctrl-C/打断：不回滚——已完成的工具调用+结果是有用上下文，
-        保留；只停在下一次模型调用前，并补齐缺失的 tool 结果（避免孤儿 → 400）。"""
+        """跑 _turn_loop，包在 try 里支持 Ctrl-C/打断：不回滚——保留已输出正文和已完成的工具结果，
+        补齐缺失的 tool 结果（避免孤儿 → 400），并当场记录中断，退出后 resume 也能看见。"""
         try:
             yield from self._turn_loop()
         except (KeyboardInterrupt, _TurnInterrupted):   # Ctrl-C(CLI) 或 request_interrupt()(TUI)
             filled = self._fill_interrupted_tool_results()
-            self._pending_interrupt_marker = not filled   # 补过 → 标记已在 tool 结果里，无需再插
-            yield Notice("已打断；已完成的工具结果保留，未继续后续动作")
+            if not filled:
+                self._record({
+                    "role": "user",
+                    "content": "[Request interrupted by user]",
+                })
+            yield Notice("已打断；已输出正文和已完成的工具结果保留，未继续后续动作")
         except GeneratorExit:               # 被 close() 关闭（打断恰在 render 处）：补齐但不能 yield
             filled = self._fill_interrupted_tool_results()
-            self._pending_interrupt_marker = not filled
+            if not filled:
+                self._record({
+                    "role": "user",
+                    "content": "[Request interrupted by user]",
+                })
             raise
         # 单一真相：每条消息由 _record 即时 append 到 transcript（含打断补齐、压缩 marker），
         # 无需批量刷盘；resume 时 fold transcript 即还原工作记忆。故这里不再存快照。
@@ -452,7 +453,7 @@ class Agent:
     def _fill_interrupted_tool_results(self) -> bool:
         """打断后保持上下文合法：给最后一条带 tool_calls 的 assistant 补齐【缺失】的 tool 结果
         （标记 [Request interrupted by user]），避免孤儿 tool_calls 导致下次请求 400。
-        返回是否补过——补过即上下文已带打断标记，下轮无需再单独插。"""
+        返回是否补过——补过即上下文已带打断标记，无需再单独插。"""
         for i in range(len(self.messages) - 1, -1, -1):
             m = self.messages[i]
             if m.get("role") == "user":
@@ -500,7 +501,7 @@ class Agent:
         self.messages = out
 
     def _turn_loop(self) -> Iterator[Event]:
-        """单轮的“模型 ↔ 工具”循环（被 run_turn 包在 try 里以支持 Ctrl-C 打断回滚）。"""
+        """单轮的“模型 ↔ 工具”循环（由 _run_loop_guarded 收尾中断，不回滚已发生的事）。"""
         iterations = 0            # 防跑飞：循环计数
         empty_retries = 0         # 空响应重试计数
         executed_tools = False    # 本轮是否执行过工具（决定空响应时的提示策略）
@@ -543,12 +544,17 @@ class Agent:
             reasoning = ""                  # 本次模型的思考正文（统一 reasoning_content 载体，无条件落盘）
             tool_calls: list[ToolCall] = []  # 本次模型要调的工具
             out_tok = think_tok = 0         # 本次响应的输出用量（落盘，供 UI 从 transcript 现数累计）
+            retry_out_tok = retry_think_tok = 0  # 失败尝试已报告的用量仍计入本次模型调用
 
             # ① 调模型，消费 Provider 事件：思考/正文透传给上层，工具调用先收集
             try:
                 for ev in self.provider.stream(self.messages, self.tools.schemas(),
                                                should_stop=self._interrupt.is_set):
                     match ev:
+                        case Retrying():
+                            reasoning = ""       # 仅本次请求的临时思考；已提交历史/工具结果不动
+                            retry_out_tok, retry_think_tok = out_tok, think_tok
+                            yield ev             # 界面同时清理，不能把两次尝试拼成一段
                         case ReasoningDelta(text=rt):
                             reasoning += rt      # 累积思考（回传 reasoning_content 用）
                             yield ev
@@ -562,15 +568,23 @@ class Agent:
                             # 输出用量【跟着 assistant 消息落盘】：prompt 不存——它是"这次带了多少
                             # 上下文"，多轮之间大量重叠，累加没有意义；completion 才是真实产出，
                             # 累计它才能在刷新页面后仍然显示整个会话产出了多少（UI 从 transcript 现数）。
-                            out_tok, think_tok = ct, rt
+                            out_tok, think_tok = retry_out_tok + ct, retry_think_tok + rt
                             yield ev                   # 透传：TUI 状态栏可实时显示 token
+                if self._interrupt.is_set():     # provider 协作停止也经过下方的正文补记
+                    raise _TurnInterrupted
             except (KeyboardInterrupt, GeneratorExit, _TurnInterrupted):
-                raise                            # 打断有自己的出口（下方 except），别在这里插手
+                # 用户已经看见的半段正文同样是历史：先落盘，再让外层补中断标记。
+                # close() 也会走这里，但不能再 yield；只出了思考/空白时不制造空 assistant。
+                # 工具调用尚未提交、更没执行，不把流中收集的调用带进历史。
+                if text.strip():
+                    self._record(self._assistant_msg(text, [], reasoning=reasoning,
+                                                     usage=(out_tok, think_tok)))
+                raise
             except Exception:
                 # 流中途断（网络重置/服务端掐断）：已产出的正文【已经显示给用户了】，但记录在循环之后，
                 # 异常一抛就跳过 → 用户说"继续"时模型不知道自己说过那半句，会从头再说一遍。
                 # 先补记再抛：报错行为不变，只是别把已发生的事丢了。（重试不做——流式重来会把已产出的
-                # token 重复一遍，provider 那边是刻意不重试的。）
+                # token 重复一遍，provider 交付正文后不会自动重试。）
                 # 【只在正文非空时补】：只出了思考的话，补的是一条 content="" 的空消息——发送时
                 # reasoning 会按档案被剥掉（多数模型收到的是光秃秃的空 assistant），而它还会顶掉压缩
                 # 里"硬保留最后一轮 assistant 原文"的位置（_last_content 撞到空串就 return None），
@@ -581,9 +595,6 @@ class Agent:
                     self._record(self._assistant_msg(text, [], reasoning=reasoning,
                                                      usage=(out_tok, think_tok)))
                 raise
-
-            if self._interrupt.is_set():     # 流式被打断（provider 已提前停）→ 走统一打断处理
-                raise _TurnInterrupted
 
             # 加固②：空响应 —— 既没文字也没工具调用，有限次重试（不记录空回合）
             if not text.strip() and not tool_calls:

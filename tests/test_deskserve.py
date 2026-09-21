@@ -382,6 +382,29 @@ def test_模型抛异常也发turn_end(desk):
     assert any(m["type"] == "notice" and "炸了" in m["text"] for m in msgs)
 
 
+def test_SSE错误原文作为notice显示并结束忙碌状态(desk):
+    import httpx
+    from mecode.config import Backend
+    from mecode.provider import Provider
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        body = 'data: ' + json.dumps({'error': {'message': '模拟：后端请求失败'}}) + '\n\n'
+        return httpx.Response(200, content=(body + 'data: [DONE]\n\n').encode())
+
+    desk.agent.provider = Provider(
+        Backend(base_url='http://test/v1', model='test', api_key='dummy'),
+        max_retries=3, backoff_base=0, transport=httpx.MockTransport(handler))
+    q = desk.bus.subscribe()
+    desk.send('你好')
+    msgs = _wait_for(q, 'turn_end')
+    assert {'type': 'notice', 'text': '模型服务返回错误：模拟：后端请求失败'} in msgs
+    assert not any(m['type'] in ('retrying', 'done', 'tool_start') for m in msgs)
+    assert len(requests) == 1 and desk.busy is False
+
+
 def test_忙时排队而不是拒绝(desk):
     """直接回 409 会让用户以为自己白打了一段字。"""
     desk.busy = True
