@@ -21,7 +21,7 @@ from typing import Callable, Iterator
 from .background import BackgroundManager, background_tools
 from .compact import _reminder, compact, estimate_tokens
 from .workflow import WorkflowRun, workflow_tools
-from .subagent import SubagentRunner, subagent_tools
+from .subagent import SUBAGENT_BATCH_ORDER, SubagentRunner, subagent_tools
 from .tasks import TaskManager, task_tools
 from .config import AgentConfig, agent_config
 from .events import (
@@ -59,6 +59,23 @@ _DENY_NO_APPROVER = ("错误：工具 {name} 需要用户授权，但当前环�
                      "不要重试或换工具绕过；跳过该动作继续能做的部分，并在最终回复里写明"
                      "哪些步骤因未获授权而没有执行。")
 _DENY_SUBAGENT = "错误：用户拒绝派生子 agent。直接告诉用户你想做什么、为何需要，然后停下。"
+
+
+def _is_foreground_subagent(tc: ToolCall) -> bool:
+    return tc.name == "subagent" and not (
+        isinstance(tc.arguments, dict) and tc.arguments.get("background"))
+
+
+def _tool_order_error(tool_calls: list[ToolCall]) -> str | None:
+    """整批预检：前台 subagent 只能构成末尾连续段，不替模型重排有依赖的操作。"""
+    seen_foreground = False
+    for index, tc in enumerate(tool_calls, start=1):
+        if _is_foreground_subagent(tc):
+            seen_foreground = True
+        elif seen_foreground:
+            return (f"错误：工具调用顺序无效，第 {index} 项 {tc.name} 出现在前台 subagent 之后。"
+                    f"本批所有工具均未执行，请修正顺序后重新调用。{SUBAGENT_BATCH_ORDER}")
+    return None
 
 
 class AskContext:
@@ -624,6 +641,18 @@ class Agent:
             if not tool_calls:
                 return
 
+            # 先检查完整批次，再审批/执行任何工具：尾部违规不能让前面的写入或后台启动先发生。
+            order_error = _tool_order_error(tool_calls)
+            if order_error:
+                # 先补齐全部结果再向界面 yield；即使显示时 close()，历史中也没有缺结果的调用。
+                for tc in tool_calls:
+                    self._record({"role": "tool", "tool_call_id": tc.id, "content": order_error})
+                for tc in tool_calls:
+                    # 与权限拒绝沿用同样的 UI 事件配对，仅展示失败调用，未执行 handler。
+                    yield ToolStarted(tc.name, tc.arguments, tc.id)
+                    yield ToolResult(tc.name, order_error, tc.id)
+                continue
+
             # ④ 有工具 → 执行、把过程产出、结果喂回对话。两类【并发】：前台 subagent 批（一批 N 个同时、
             #    等齐所有结果；wall-clock=最慢那个、不是求和——顺序阻塞就退化成 leader 自己干）；
             #    连续的只读工具组（read_only=True，见下方分组循环）。其余工具顺序跑。
@@ -631,11 +660,9 @@ class Agent:
             no_edit = 0 if self._edits_project(tool_calls) else no_edit + 1
             # 前台 subagent（无 background）→ 并发批；后台 subagent（background:true）归 others → _exec_tool 拿 bg
             # 起（start_subagent，立即返回 id、不阻塞），和 bash background 一个套路。
-            def _fg_sub(tc):
-                return tc.name == "subagent" and not (
-                    isinstance(tc.arguments, dict) and tc.arguments.get("background"))
-            subs = [tc for tc in tool_calls if _fg_sub(tc)]
-            others = [tc for tc in tool_calls if not _fg_sub(tc)]
+            # 预检已保证 subs 全在末尾；分组不再悄悄改变模型给出的前后次序。
+            subs = [tc for tc in tool_calls if _is_foreground_subagent(tc)]
+            others = [tc for tc in tool_calls if not _is_foreground_subagent(tc)]
             # others 按模型给出的顺序走：【连续的只读工具】攒成一组并发执行（等齐再继续），
             # 非只读工具是屏障——先冲掉手头攒的只读组、再串行执行它。这样读写交错时语义同纯串行
             # （若无屏障，[read A, edit A, read A] 重排后第二个 read 会读到改前内容）。

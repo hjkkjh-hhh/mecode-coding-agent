@@ -31,6 +31,12 @@ GREP_MAX_OUTPUT_CHARS = 8000         # grep 结果截断上限
 GLOB_MAX_RESULTS = 100               # glob 默认最多返回多少个文件
 GLOB_MAX_OUTPUT_CHARS = 6000         # glob 结果截断上限
 
+BACKGROUND_TASK_GUIDANCE = (
+    "后台只用于独立、结果不急着用的任务：无需等待其结果，你仍能推进其他工作。"
+    "下一步就依赖结果时使用前台。返回任务编号仅表示已启动，不代表已完成；"
+    "不要用连续轮询把后台任务当作前台等待。"
+)
+
 
 def truncate_output(text: str, max_chars: int, keep_tail: int) -> str:
     """工具结果【入场截断】：超长就留头+尾、中间挖掉，并标注省略量。
@@ -206,7 +212,8 @@ def _bash_description() -> str:
     # 执行和描述共用 _detect_shell，二者永远一致：选哪个 shell，就让模型用哪种语法。
     _, hint = _detect_shell()
     return ("在 shell 里执行一条命令，返回 stdout、stderr 和非零退出码。"
-            f"默认超时 30 秒，可用 timeout（秒）调整。当前请用 {hint}。")
+            f"前台默认超时 30 秒，可用 timeout（秒）调整。当前请用 {hint}。\n"
+            f"{BACKGROUND_TASK_GUIDANCE}")
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
@@ -757,9 +764,9 @@ def default_registry() -> ToolRegistry:
                 "timeout": {"type": "integer",
                             "description": "超时秒数（前台默认 30；后台默认不限时，传了则后台也按此限时）"},
                 "background": {"type": "boolean",
-                               "description": "长/不定时命令（dev server、watch、长构建/测试）设 true → "
-                                              "转后台跑、立即返回任务编号、不阻塞；完成或卡住会通知你，"
-                                              "可用 kill_bgtask(编号) 终止。短命令别用，直接前台跑。"},
+                               "description": "默认 false=前台等待结果；仅独立且结果不急用的任务设 true → "
+                                              "转后台跑、立即返回任务编号，完成或定时检查会通知你；"
+                                              "可用 kill_bgtask(编号) 终止。不能仅因命令耗时长就转后台。"},
             },
             "required": ["command"],
         },

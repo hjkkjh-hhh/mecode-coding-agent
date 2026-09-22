@@ -23,7 +23,14 @@ from __future__ import annotations
 
 import threading
 
-from .tools import Tool, default_registry
+from .tools import BACKGROUND_TASK_GUIDANCE, Tool, default_registry
+
+SUBAGENT_BATCH_ORDER = (
+    "【批次顺序】同一条回复的 tool_calls 中，所有前台 subagent 必须连续放在末尾；"
+    "普通工具及后台任务启动（含 background=true 的 subagent/bash）必须在它们之前。"
+    "顺序违规时整批拒绝，所有工具都不会执行。"
+    "依赖前台子 agent 结果的操作，等结果返回后在下一轮调用。"
+)
 
 SUBAGENT_PROMPT = """你是一个【子 agent】，由主 agent 派来完成一个相对独立的子任务。
 - 专注完成派给你的这一个任务：自主读文件 / 改代码 / 跑命令 / 搜索，别问用户——没有用户能回答你。
@@ -154,7 +161,9 @@ def subagent_tools(runner: SubagentRunner) -> list[Tool]:
                     "它跑不动或失败也会在总结里说明。它自己【不能】再派子 agent。\n"
                     "【前台（默认）vs 后台】：要它的结果才能往下走（调研/多角度/验证）→ 用前台，"
                     "同一条消息里发【多个】subagent 调用会【并发】跑、等齐所有结果（三个各 30s 的，30s 跑完不是 90s）；"
-                    "真正独立、不用马上要 → 设 background=true 转后台，立即返回编号、完成再通知你（可 kill_bgtask 停）。\n"
+                    "设 background=true 转后台，立即返回编号、完成再通知你（可 kill_bgtask 停）。\n"
+                    f"{BACKGROUND_TASK_GUIDANCE}\n"
+                    f"{SUBAGENT_BATCH_ORDER}\n"
                     "【什么时候【不】该派】：目标已经明确就直接自己做——知道路径就 read_file、"
                     "找某个符号就 grep；一两步能做完的事别派子 agent，那比自己做还慢。\n"
                     "子 agent 改过代码的，你要自己核一遍实际改动再向用户汇报，别只转述它的总结。\n"
@@ -169,7 +178,7 @@ def subagent_tools(runner: SubagentRunner) -> list[Tool]:
                 "prompt": {"type": "string",
                            "description": "交给子 agent 的子任务描述，越具体越好（目标 / 范围 / 验收标准）"},
                 "background": {"type": "boolean",
-                               "description": "true=转后台跑、立即返回编号、完成通知你（用于独立且不急的活）；"
+                               "description": "true=转后台跑、立即返回编号，仅用于独立且结果不急用的任务；"
                                               "默认 false=前台，多个前台调用会并发、等齐所有结果"},
             },
             "required": ["description", "prompt"],
