@@ -87,6 +87,28 @@ def desk(workdir, monkeypatch):
     d.close()
 
 
+def test_mode_switch_persists_before_next_turn_and_plan_survives_resume(desk):
+    import json
+    from mecode.permission import ALLOW, DENY
+
+    desk.agent.ask("调查")
+    old = list(desk.agent.messages)
+    session_id = desk.agent.store.session_id
+    assert desk.set_mode("plan")
+    assert desk.agent.messages == old
+    meta = json.loads(desk.agent.store.session_json.read_text(encoding="utf-8"))
+    assert meta["mode"] == "plan"
+    assert desk.resume(session_id)
+    assert desk.mode == desk.agent.mode == "plan"
+    path = desk.agent.store.plan_path.as_posix()
+    assert path in desk.agent.mode_reminder
+    assert desk.agent.policy.decide("write_file", {"path": path}) == ALLOW
+    assert desk.agent.policy.decide("bash", {"command": "echo changed"}) == DENY
+    desk.agent.provider = _FakeProvider()  # resume 重建真实 provider；本测试不联网。
+    desk.agent.ask("继续调查")
+    assert [m["_mode"] for m in desk.agent.messages if "_mode" in m] == ["normal", "plan"]
+
+
 # ---------------------------------------------------------------- 事件序列化
 
 def test_encode_各事件类型():

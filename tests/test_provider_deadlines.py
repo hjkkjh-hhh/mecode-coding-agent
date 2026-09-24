@@ -203,7 +203,8 @@ def test_deadline_preserves_partial_text_without_executing_tools_or_retrying(tmp
     with pytest.raises(ProviderError, match='单次请求' if scope == 'single' else '总等待时间'):
         events.extend(agent.run_turn('hi'))
     assert store.load_messages() == [
-        {'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'partial'}]
+        {'role': 'user', 'content': 'hi'}, agent._mode_message(),
+        {'role': 'assistant', 'content': 'partial'}]
     assert not executed and len(requests) == 1 and body.closed.is_set()
     assert not any(isinstance(e, (Retrying, ToolCall, Done)) for e in events)
 

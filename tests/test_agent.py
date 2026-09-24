@@ -2,7 +2,7 @@
 
 固化的不变量：
 - 压缩发生在 append 之前：当前问题不会被卷进摘要
-- 未超阈值不压缩：旧历史原样、无 reminder 注入
+- 未超阈值不压缩：旧历史原样、无压缩 reminder 注入
 （会话存储/单一真相/工具外置见 test_session.py）
 """
 from dataclasses import replace
@@ -53,7 +53,8 @@ def test_未超阈值不压缩(tmp_path):
     a.context_tokens = 100                        # 远低于阈值
     list(a.run_turn("新问题"))
     assert any(m.get("content") == "老问题" for m in a.messages)        # 原样还在
-    assert not any("<system-reminder>" in m.get("content", "") for m in a.messages)
+    assert not any("<system-reminder>" in m.get("content", "")
+                   for m in a.messages if "_mode" not in m)
 
 
 def test_后端不回usage_本地估算兜底触发压缩(tmp_path):

@@ -2870,30 +2870,14 @@ class MecodeApp(App):
             self.agent.store.write_header(thinking_on=thinking_on, effort=effort)
 
     def _set_mode(self, key: str) -> None:
-        """切到指定模式：重建 policy（叠加覆盖）+ 设本模式的每轮提示词 + 持久化 + 刷视觉。
-        【不碰 system prompt】——模式提示词改由 agent 每轮以 <system-reminder> 注入（保前缀缓存）。
-        不打断当前轮：policy 下个 gate 生效、提示词下一轮注入生效。"""
+        """切模式并立即保存，再刷新视觉；Agent 在下次模型请求前按需追加声明。
+        不打断当前轮：policy 下个 gate 生效，不修改已经发送的历史。"""
         if key not in MODES:
             return
         self._mode = key
         if key != "plan":
             self._last_exec_mode = key              # 记住最近的执行模式（plan 批准后回退到它）
-        self.agent.mode = key                       # write_header 每轮据此把模式落 session.json → resume 恢复
-        store = self.agent.store
-        plan_path = store.plan_path.as_posix() if store is not None else None
-        if store is not None:                       # 注入式 agent（测试）可能无 store：跳过 policy 重建
-            policy = apply_mode(
-                PermissionPolicy.from_persisted(store.load_permissions(), project_root=store.cwd), key)
-            if key == "plan":
-                policy.plan_path = plan_path        # 计划模式：放行对计划文件的 write/edit（只读之下的例外）
-            self.agent.policy = policy
-        # 模式提示词：plan/yolo 有段 → 每轮注入（normal/auto 空 → 静默）；plan 再把【计划文件路径】拼进去，模型才知道写哪
-        reminder = MODES[key].prompt
-        if key == "plan" and plan_path:
-            reminder += f"\n计划文件（把计划写在这里、用 write_file/edit_file 迭代它）：{plan_path}"
-        self.agent.mode_reminder = reminder
-        # 子 agent 版模式段：造子 agent 时拼进它的 system prompt（不含计划文件那句——子 agent 不写计划）
-        self.agent.subagent_reminder = MODES[key].sub_prompt
+        self.agent.set_mode(key)
         self._refresh_mode_indicator()
 
     def _refresh_mode_indicator(self) -> None:
@@ -3218,15 +3202,15 @@ class MecodeApp(App):
         self._mount(Static(Text(f"（已切换到 {be.model}，即刻生效）", style="green")), batch=False)
 
     def _show_system_prompt(self) -> None:
-        """/system：把当前发给模型的 system prompt（messages[0]）+ 本模式每轮注入的 <system-reminder>
+        """/system：把当前发给模型的 system prompt（messages[0]）+ 本模式按需追加的 <system-reminder>
         原样显示，供开发时查看（模型被训练成不吐 system prompt，问它不可靠）。纯本地、不调模型。"""
         msgs = self.agent.messages
         sysmsg = msgs[0]["content"] if msgs and msgs[0].get("role") == "system" else "（当前没有 system 消息）"
         body = Text()
         body.append(f"当前 system prompt（{len(sysmsg)} 字）\n", style="bold yellow")
         body.append(sysmsg)
-        if self.agent.mode_reminder:                    # A 重构后模式提示词不在 system、改每轮注入 → 单列出来
-            body.append(f"\n\n本模式（{self._mode}）每轮注入的 <system-reminder>：\n", style="bold yellow")
+        if self.agent.mode_reminder:                    # 模式声明不在 system，按需追加 → 单列出来
+            body.append(f"\n\n当前模式（{self._mode}）的说明（变化时追加）：\n", style="bold yellow")
             body.append(self.agent.mode_reminder, style="dim")
         self._mount(Static(body), batch=False)
 
@@ -3592,7 +3576,7 @@ class MecodeApp(App):
             restored = DEFAULT_MODE
         self._memory_prompt = build_memory_prompt(store.memory_dir)
         self.agent = Agent(Provider(current_backend()), self._tool_reg or default_registry(),
-                           system_prompt=self._system_text(session_dir=store.dir),   # 与模式无关（模式提示词每轮注入）
+                           system_prompt=self._system_text(session_dir=store.dir),   # 与模式无关（模式声明按需追加）
                            config=current_agent_config(),
                            store=store, resume_messages=store.load_messages() or None,
                            policy=PermissionPolicy.from_persisted(

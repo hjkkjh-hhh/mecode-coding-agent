@@ -29,8 +29,7 @@ from .agent import Agent
 from .config import agent_config, current_agent_config, current_backend
 from .mcp import setup_mcp
 from .memory import build_memory_prompt, memory_tools
-from .mode import MODES, apply_mode
-from .permission import PermissionPolicy
+from .mode import MODES
 from .provider import Provider
 from .session import SessionStore
 from .system_prompt import build_system_prompt
@@ -84,11 +83,7 @@ def build_agent(cwd: str | Path | None = None, *, mode: str = "auto",
                   config=current_agent_config(),
                   store=store,
                   resume_messages=(store.load_messages() or None) if session_id else None,
-                  policy=apply_mode(PermissionPolicy.from_persisted(
-                      store.load_permissions(), project_root=store.cwd), mode),
                   ask_permission=ask_permission)
-    agent.mode = mode
-    agent.mode_reminder = MODES[mode].prompt      # 模式段每轮注入（不进 system prompt，同 TUI 约定）
-    agent.subagent_reminder = MODES[mode].sub_prompt   # 同模式的子 agent 版说法（造子 agent 时拼进它的 system）
+    agent.set_mode(mode, persist=bool(session_id))   # 新会话保留懒创建；显式 resume 模式立即保存
     agent.mcp_clients = mcp_clients               # 暴露给调用方显式 stop；registry 复用时为空（归首建者管）
     return agent

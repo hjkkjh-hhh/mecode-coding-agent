@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -44,6 +45,8 @@ class SessionStore:
         self.session_id = session_id or str(uuid.uuid4())
         self.dir = (self.root / "projects" / project_slug(self.cwd)
                     / "sessions" / self.session_id)
+        # UI 切模式与 worker 写用量可能同时发生；会话头的读-改-写必须串行，避免互相覆盖。
+        self._header_lock = threading.RLock()
 
     # --- 路径（懒创建：写时才建目录，纯读路径不产生空文件夹）---
     @property
@@ -146,45 +149,47 @@ class SessionStore:
         最终上下文 token 数（供 resume 立即显示用量、不用等首条消息）；thinking_on/effort 给了就覆盖为
         当前思考运行态（resume 恢复）。只覆盖给了的字段，故各处分别调用不会互相清掉。
         这是会话清单的"封面"，与 transcript 解耦。"""
-        self.dir.mkdir(parents=True, exist_ok=True)
-        meta: dict = {}
-        if self.session_json.is_file():
-            meta = json.loads(self.session_json.read_text(encoding="utf-8"))
-        now = time.time()
-        meta.setdefault("session_id", self.session_id)
-        meta.setdefault("cwd", str(self.cwd))
-        meta.setdefault("slug", project_slug(self.cwd))
-        meta.setdefault("created_at", now)
-        meta["updated_at"] = now
-        if title and not meta.get("title"):
-            meta["title"] = title[:80]
-        if mode is not None:
-            meta["mode"] = mode                    # 当前模式随会话头落盘（每轮覆盖），resume 从这里恢复
-        if context_tokens is not None:
-            meta["context_tokens"] = context_tokens   # 最终上下文 token 数：resume 立即显示，不用等首条消息
-        if thinking_on is not None:
-            meta["thinking_on"] = thinking_on         # 思考开关运行态，resume 恢复
-        if effort is not None:
-            meta["effort"] = effort                   # 思考深度档，resume 恢复
-        self.session_json.write_text(
-            json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        with self._header_lock:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            meta: dict = {}
+            if self.session_json.is_file():
+                meta = json.loads(self.session_json.read_text(encoding="utf-8"))
+            now = time.time()
+            meta.setdefault("session_id", self.session_id)
+            meta.setdefault("cwd", str(self.cwd))
+            meta.setdefault("slug", project_slug(self.cwd))
+            meta.setdefault("created_at", now)
+            meta["updated_at"] = now
+            if title and not meta.get("title"):
+                meta["title"] = title[:80]
+            if mode is not None:
+                meta["mode"] = mode                  # 切换时立即保存，resume 从这里恢复
+            if context_tokens is not None:
+                meta["context_tokens"] = context_tokens
+            if thinking_on is not None:
+                meta["thinking_on"] = thinking_on
+            if effort is not None:
+                meta["effort"] = effort
+            self.session_json.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def _patch_header(self, **fields) -> dict:
         """读-改-写会话头。读不动就当空 dict 起一份——一个坏文件不该让改名/归档整个失败。"""
-        meta: dict = {}
-        if self.session_json.is_file():
-            try:
-                meta = json.loads(self.session_json.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                meta = {}
-        meta.setdefault("session_id", self.session_id)
-        meta.setdefault("cwd", str(self.cwd))
-        meta.setdefault("slug", project_slug(self.cwd))
-        meta.update(fields)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.session_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
-                                     encoding="utf-8")
-        return meta
+        with self._header_lock:
+            meta: dict = {}
+            if self.session_json.is_file():
+                try:
+                    meta = json.loads(self.session_json.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    meta = {}
+            meta.setdefault("session_id", self.session_id)
+            meta.setdefault("cwd", str(self.cwd))
+            meta.setdefault("slug", project_slug(self.cwd))
+            meta.update(fields)
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.session_json.write_text(json.dumps(meta, ensure_ascii=False, indent=2),
+                                         encoding="utf-8")
+            return meta
 
     def set_title(self, title: str) -> str:
         """用户手动改名。

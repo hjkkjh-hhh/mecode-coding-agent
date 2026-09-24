@@ -1,8 +1,4 @@
-"""运行模式：权限叠加（apply_mode）+ 循环序（next_mode）+ system prompt 注入模式段/SAFETY。
-
-纯逻辑，不起 TUI。auto/plan/yolo 的提示词段随各自模式落地时再补断言；本文件先固化框架不变量：
-① 各模式的权限覆盖正确 ② 循环序自洽 ③ SAFETY 常驻、mode 参数被接受 ④ Agent 换 system。
-"""
+"""运行模式：权限叠加、循环序、模式声明按需追加；纯逻辑，不起 TUI。"""
 from mecode.mode import CYCLE, DEFAULT_MODE, MODES, apply_mode, next_mode
 from mecode.permission import ALLOW, DENY, PermissionPolicy
 from mecode.system_prompt import SAFETY, build_system_prompt
@@ -70,7 +66,7 @@ def test_next_mode_循环一圈回起点():
 def test_build_system_prompt_SAFETY常驻_不含模式段():
     sp = build_system_prompt(project_context="")
     assert SAFETY in sp and "编程助手" in sp        # SAFETY 常驻、BASE 仍在
-    # 模式行为段【不】进 system prompt（改每轮注入，保前缀缓存）：非空的模式提示词都不应出现在 system 里
+    # 模式行为段不进 system prompt，变化时追加声明。
     for m in MODES.values():
         if m.prompt:
             assert m.prompt not in sp                # 如 yolo 的自查段
@@ -84,18 +80,20 @@ def _fake_agent(reminder: str = ""):
     return a
 
 
-def test_mode_reminder_非空则每轮注入且在用户消息前():
+def test_mode_reminder_首次请求追加且后续不重复():
     a = _fake_agent("计划模式：只读探索、先出计划")
     list(a.run_turn("改一下 x"))
     conts = [m["content"] for m in a.messages if m["role"] == "user"]
     rem_i = next(i for i, c in enumerate(conts)
                  if "system-reminder" in c and "计划模式：只读探索、先出计划" in c)
     usr_i = next(i for i, c in enumerate(conts) if c == "改一下 x")
-    assert rem_i < usr_i                              # 模式提示贴在用户消息【之前】（prepend）
+    assert rem_i > usr_i                              # 请求前追加，不从历史中抽出再搬到末尾。
+    list(a.run_turn("继续"))
+    assert sum("_mode" in m for m in a.messages) == 1
 
 
 def test_mode_reminder_为空则不注入():
-    a = _fake_agent("")                               # normal/auto：mode_reminder 空
+    a = _fake_agent("")                               # 显式不配置声明（生产入口四个模式均有正文）
     list(a.run_turn("hi"))
     assert not any("system-reminder" in m.get("content", "") for m in a.messages)
 

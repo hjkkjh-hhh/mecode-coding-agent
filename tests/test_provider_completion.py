@@ -123,10 +123,12 @@ def test_sse_error_preserves_partial_text_and_does_not_execute_buffered_tools(tm
                         handler=lambda args: executed.append(args) or 'done'))
     store = SessionStore(root=tmp_path, cwd=tmp_path)
     events = []
+    agent = Agent(provider, tools, system_prompt='s', store=store)
     with pytest.raises(ProviderError, match='upstream failed'):
-        events.extend(Agent(provider, tools, system_prompt='s', store=store).run_turn('hi'))
+        events.extend(agent.run_turn('hi'))
     assert store.load_messages() == [
-        {'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'partial'}]
+        {'role': 'user', 'content': 'hi'}, agent._mode_message(),
+        {'role': 'assistant', 'content': 'partial'}]
     assert not executed and len(requests) == 1 and stream.closed
     assert not any(isinstance(e, (Retrying, ToolCall, Done)) for e in events)
 
@@ -192,7 +194,8 @@ def test_partial_text_is_saved_without_retry_or_tool_execution(tmp_path):
         events.extend(agent.run_turn('hi'))
     assert not executed and len(requests) == 1 and stream.closed
     assert store.load_messages() == [
-        {'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'partial'}]
+        {'role': 'user', 'content': 'hi'}, agent._mode_message(),
+        {'role': 'assistant', 'content': 'partial'}]
     assert not any(isinstance(e, Retrying) for e in events)
 
 
@@ -274,6 +277,7 @@ def test_stop_at_eof_remains_user_interrupt(tmp_path, has_marker):
     assert len(requests) == 1 and stream.closed
     assert not any(isinstance(e, Retrying) for e in events)
     assert store.load_messages() == [
-        {'role': 'user', 'content': 'hi'}, {'role': 'assistant', 'content': 'partial'},
+        {'role': 'user', 'content': 'hi'}, agent._mode_message(),
+        {'role': 'assistant', 'content': 'partial'},
         {'role': 'user', 'content': '[Request interrupted by user]'}]
     assert any(isinstance(e, Notice) and '已打断' in e.text for e in events)

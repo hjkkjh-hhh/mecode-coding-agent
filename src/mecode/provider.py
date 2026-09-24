@@ -31,8 +31,9 @@ _RETRIABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 # 只存不发的【mecode 自有字段】：transcript 里带着，发送前由 _for_wire 剥掉。
 #   usage —— 每条 assistant 响应的输出用量（agent._assistant_msg 写入），
 #            存下来 UI 才能刷新后仍累计出整个会话产出了多少 token。
+#   _mode —— 程序生成的模式声明标记，供去重与 resume 使用，不属于 API 消息字段。
 # 加新的内部字段【必须】同步这里，否则会随消息发给后端（严格的后端见到不认识的键会 400）。
-_INTERNAL_KEYS = frozenset({"usage"})
+_INTERNAL_KEYS = frozenset({"usage", "_mode"})
 _T = TypeVar("_T")
 
 
@@ -300,17 +301,13 @@ class Provider:
         scope = self.profile.keep_reasoning
         out = []
         for m in messages:
-            drop = _INTERNAL_KEYS & m.keys()
-            if m.get("role") != "assistant" or ("reasoning_content" not in m and not drop):
-                out.append(m)
-                continue
-            keep = scope == "all" or (scope == "tool_calls" and bool(m.get("tool_calls")))
-            if not keep or drop:
-                m = dict(m)
+            drop = set(_INTERNAL_KEYS & m.keys())
+            if m.get("role") == "assistant" and "reasoning_content" in m:
+                keep = scope == "all" or (scope == "tool_calls" and bool(m.get("tool_calls")))
                 if not keep:
-                    m.pop("reasoning_content", None)
-                for k in drop:
-                    m.pop(k, None)
+                    drop.add("reasoning_content")
+            if drop:
+                m = {k: v for k, v in m.items() if k not in drop}
             out.append(m)
         return out
 

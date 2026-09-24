@@ -206,9 +206,9 @@ def _reminder(text: str) -> str:
 
 
 def _last_content(old: list[dict], role: str) -> str | None:
-    """old 里最后一条指定 role 的正文。assistant 只取 content，自然丢掉 tool_calls。"""
+    """old 里最后一条指定 role 的正文；模式声明不冒充最近用户任务，assistant 只取 content。"""
     for m in reversed(old):
-        if m.get("role") == role:
+        if m.get("role") == role and "_mode" not in m:
             text = (m.get("content") or "").strip()
             return text or None
     return None

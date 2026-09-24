@@ -56,6 +56,7 @@ def test_build_agent_组装齐全(monkeypatch, tmp_path):
     assert a.store.cwd == Path(tmp_path)                                    # 会话归属/权限根 = cwd
     assert a.messages[0]["role"] == "system" and a.messages[0]["content"].strip()
     assert a.mcp_clients == []                                              # mcp=False 不连
+    assert not a.store.dir.exists()                                        # 初次组装仍懒创建
 
 
 def test_plan模式_明确拒绝(monkeypatch, tmp_path):

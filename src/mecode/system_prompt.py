@@ -118,8 +118,8 @@ def build_system_prompt(extra: str = "", project_context: str | None = None,
     技能索引段：按需加载的领域流程（skills.py 渐进式披露）——索引常驻、全文模型自己 read_file。
     启停变更【新会话生效】（本函数只在会话创建时调，天然满足；当前会话前缀不动、不击穿缓存）。
 
-    【与模式无关】：模式行为段【不】进 system prompt——否则切模式改前缀会击穿 prompt 缓存。改由 run_turn
-    每轮把当前模式的提示词以 <system-reminder> 注入最新消息（见 agent._inject_mode_reminder）。"""
+    【与模式无关】：模式行为段【不】进 system prompt。Agent 在首次请求、模式变化或压缩后
+    追加 <system-reminder>，不修改已发送的前缀（见 agent._inject_mode_reminder）。"""
     from .skills import build_skills_prompt, discover_skills   # 局部 import：避免顶层循环
     from .tools import disabled_tools                          # 同上（tools.py 反向依赖本模块）
     if project_context is None:

@@ -29,6 +29,7 @@ from .events import (
     ToolStarted, Usage,
 )
 from .permission import ALLOW, ALWAYS, ASK, DENY, PermissionPolicy
+from .mode import MODE_NOTICE, MODES, apply_mode
 from .provider import Provider
 from .session import SessionStore
 from .tools import ProcSlot, ToolRegistry, truncate_output
@@ -131,11 +132,11 @@ class Agent:
         # ask 时调 ask_permission 问用户（消费端注入 once/always/deny）。
         self.policy = policy
         self.ask_permission = ask_permission
-        # 当前运行模式（key）：write_header 每轮据此把模式落进 session.json（resume 恢复）。消费端(TUI)切模式时设。
+        # UI 通过 set_mode 更新；锁只保护模式快照，不覆盖模型调用或工具执行。
+        self._mode_lock = threading.RLock()
         self.mode = "normal"
-        # 当前模式的每轮提示词（plan/yolo 有，normal/auto 空）。由消费端（TUI）按模式设；_pre_turn 每轮把它
-        # 作为 user+<system-reminder> 注入到最新消息处——【不进 system prompt】，保持前缀稳定、不击穿 prompt 缓存。
-        self.mode_reminder = ""
+        # 主 agent 首次/切换/压缩后声明模式；子 agent 使用自己的 system 模式段，不能被 normal 覆盖。
+        self.mode_reminder = "" if subagent else MODES[self.mode].prompt
         # 同模式下【给子 agent 的】说法（Mode.sub_prompt）：SubagentRunner 造子 agent 时拼进它的
         # system prompt。与 mode_reminder 分开存——主 agent 那段是写给"要产出计划文件、调 exit_plan"
         # 的角色看的，照搬给子 agent 有害（见 mode.PLAN_SUB_PROMPT 的注释）。
@@ -212,8 +213,31 @@ class Agent:
         if self.store is not None:
             self.store.append_transcript(msg)
 
+    def set_mode(self, key: str, *, persist: bool = True) -> None:
+        """消费端共用的切换入口：权限即时更新，模式声明在下次模型请求的安全边界追加。
+
+        不从 UI 线程改 messages，避免插进尚未配齐结果的工具批次。初次组装可 persist=False
+        保留懒创建；运行时切换立即保存，即使没有下一轮用户输入也能正确 resume。
+        """
+        mode = MODES[key]
+        with self._mode_lock:
+            reminder = mode.prompt
+            if self.store is not None:
+                policy = apply_mode(PermissionPolicy.from_persisted(
+                    self.store.load_permissions(), project_root=self.store.cwd), key)
+                if key == "plan":
+                    path = self.store.plan_path.as_posix()
+                    policy.plan_path = path
+                    reminder += f"\n计划文件（用 write_file/edit_file 迭代）：{path}"
+                self.policy = policy
+                if persist:
+                    self.store.write_header(mode=key)
+            self.mode = key
+            self.mode_reminder = reminder
+            self.subagent_reminder = mode.sub_prompt
+
     def update_system_prompt(self, text: str) -> None:
-        """替换 system 消息（messages[0]）为新的 system prompt。模式切换时用：重建带新模式段的 prompt 换上。
+        """替换 system 消息（messages[0]）为新的运行环境提示；模式切换不调用它。
         system 本就只在 RAM、不写 transcript（运行时配置），换它不动对话历史。"""
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = text
@@ -271,7 +295,8 @@ class Agent:
         self._record({"role": "user", "content": user_input})
         if self.store is not None:
             # 会话头：首轮设标题、每轮刷新 updated_at + 落当前模式（resume 恢复），供 /rl /rs 列会话挑选
-            self.store.write_header(title=user_input, mode=self.mode)
+            with self._mode_lock:
+                self.store.write_header(title=user_input, mode=self.mode)
         yield from self._run_loop_guarded()
         self._persist_context_size()                 # 轮末：最终上下文 token 数落会话头 → resume 立即显示
 
@@ -344,7 +369,7 @@ class Agent:
             self._record({"role": "user", "content": _reminder(resume_hint)})
 
     def _pre_turn(self) -> Iterator[Event]:
-        """每轮开头的公共准备：清打断标志、（满了就）压缩、补上一轮遗留的打断标记。run_turn / run_bg_turn 共用。"""
+        """每轮公共准备：清打断标志、必要时压缩、追加一次性提示。run_turn / run_bg_turn 共用。"""
         # 每轮开头清掉上一轮残留的打断标志。
         # 【已知取舍，勿当新 bug 挖】共用同一个 Event 的从属 agent（前台子 agent、workflow 阶段）
         # 开轮时也会执行这句，等于替用户撤销刚下的打断 → 存在一个"按 Ctrl+C 却没停下"的窗口。
@@ -355,16 +380,29 @@ class Agent:
         self._interrupt.clear()
         # 加固④：上下文压缩 —— 在追加本轮内容【之前】压一次。旧历史交给摘要承载，本轮新内容随后原样追加。
         yield from self._maybe_compact()
-        self._inject_mode_reminder()     # 模式行为提示词（plan/yolo）：每轮注入到压缩之后、本轮内容之前（最新消息处）
         if self._pending_reminder:       # 一次性 reminder（如批准计划的执行提示）：注入一次即清，不显示成用户消息
             self._record({"role": "user", "content": _reminder(self._pending_reminder)})
             self._pending_reminder = ""
 
+    def _mode_message(self) -> dict | None:
+        """生成模式快照；_mode 是本地来源标记，provider 发送时剥掉，不增加 API token。"""
+        with self._mode_lock:
+            if self._is_subagent or not self.mode_reminder:
+                return None
+            return {"role": "user", "content": _reminder(MODE_NOTICE + self.mode_reminder),
+                    "_mode": self.mode}
+
     def _inject_mode_reminder(self) -> None:
-        """当前模式若有行为提示词（plan/yolo），每轮开头注入一条 user+<system-reminder>——贴在最新消息处、
-        不进 system prompt（前缀稳→不击穿缓存）。normal/auto 的 mode_reminder 为空 → 不注。切模式即时生效（下一轮）。"""
-        if self.mode_reminder:
-            self._record({"role": "user", "content": _reminder(self.mode_reminder)})
+        """只与有效上下文中最近一次程序声明比较，不改/删旧消息，不靠用户正文猜模式。
+        比较正文也能发现提示词更新和计划文件路径变化；resume 直接复用同一判断。
+        """
+        current = self._mode_message()
+        if current is None:
+            return
+        previous = next((m for m in reversed(self.messages)
+                         if m.get("role") == "user" and "_mode" in m), None)
+        if previous != current:
+            self._record(current)
 
     @staticmethod
     def _edits_project(tool_calls: list[ToolCall]) -> bool:
@@ -565,6 +603,8 @@ class Agent:
 
             # ① 调模型，消费 Provider 事件：思考/正文透传给上层，工具调用先收集
             try:
+                # 工具结果已补齐、压缩与后台消息已处理。只在需要时追加，下一次请求沿用稳定前缀。
+                self._inject_mode_reminder()
                 for ev in self.provider.stream(self.messages, self.tools.schemas(),
                                                should_stop=self._interrupt.is_set):
                     match ev:
@@ -788,8 +828,10 @@ class Agent:
                 yield ToolResult(tc.name, result, tc.id)
 
     def _on_compacted(self, image: list[dict]) -> None:
-        """压缩完成回调（compact 注入）：把 compaction marker 写进 transcript。
-        marker 只带压缩后镜像——resume 时 fold 取回工作记忆；摘要已嵌在镜像里，不另存。无 store 则空操作。"""
+        """把当前模式加入压缩镜像后一起存档；不信任摘要中的旧模式，也不等下一轮才落盘。"""
+        current = self._mode_message()
+        if current is not None:
+            image.append(current)
         if self.store is not None:
             self.store.mark_compaction(image=image)
 

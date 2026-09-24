@@ -61,6 +61,7 @@ def test_中断正文立即落盘且下一次请求只带一次(tmp_path, mode, 
 
     expected = [
         {"role": "user", "content": "请分析"},
+        agent._mode_message(),
         {"role": "assistant", "content": provider.text,
          "reasoning_content": "已产生的思考"},
         MARKER,
@@ -94,7 +95,8 @@ def test_只有思考或空白时不制造空assistant(tmp_path, mode, text):
     agent = Agent(provider, ToolRegistry(), store=store)
     provider.agent = agent
     interrupt_turn(agent, mode, text)
-    assert store.load_messages() == [{"role": "user", "content": "请分析"}, MARKER]
+    assert store.load_messages() == [{"role": "user", "content": "请分析"},
+                                     agent._mode_message(), MARKER]
 
 
 def test_流式阶段中断不执行或存入尚未提交的工具调用(tmp_path):
@@ -116,6 +118,7 @@ def test_流式阶段中断不执行或存入尚未提交的工具调用(tmp_pat
     assert not executed
     assert store.load_messages() == [
         {"role": "user", "content": "执行"},
+        agent._mode_message(),
         {"role": "assistant", "content": "准备操作", "usage": {"completion": 3, "reasoning": 0}},
         MARKER,
     ]

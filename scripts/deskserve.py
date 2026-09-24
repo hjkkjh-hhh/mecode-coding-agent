@@ -110,7 +110,7 @@ from mecode.mcp import (                                                  # noqa
     server_states, set_server_enabled, set_server_timeout,
 )
 from mecode.memory import build_memory_prompt, memory_tools               # noqa: E402
-from mecode.mode import DEFAULT_MODE, MODES, apply_mode                   # noqa: E402
+from mecode.mode import DEFAULT_MODE, MODES                               # noqa: E402
 from mecode.permission import (                                           # noqa: E402
     ALWAYS, DENY, ONCE, PermissionPolicy, pattern_for,
 )
@@ -884,7 +884,7 @@ class Desk:
         self.agent.request_interrupt()
 
     def set_mode(self, mode: str) -> bool:
-        """切模式 = 重建权限策略（同 TUI）。模式提示词每轮注入，不进 system prompt。
+        """切模式并立即保存（同 TUI）；模式声明在下次模型请求前按需追加。
 
         【计划模式在这里是支持的】——build_agent 拒绝以 plan 启动，那条限制是给无头场景的
         （"计划需要人审批，无头没人批"）；桌面端有界面、有人可以批，所以只是不能【以它启动】，
@@ -892,23 +892,9 @@ class Desk:
         """
         if mode not in MODES:
             return False
-        st = self.agent.store
-        plan_path = st.plan_path.as_posix() if st is not None else None
         if mode != "plan":
             self._last_exec_mode = mode        # 记住最近的执行模式：批准计划后回退到它
-        if st is not None:
-            policy = apply_mode(
-                PermissionPolicy.from_persisted(st.load_permissions(), project_root=st.cwd), mode)
-            if mode == "plan" and plan_path:
-                policy.plan_path = plan_path   # 计划模式只读，但对计划文件本身放行（唯一的例外）
-            self.agent.policy = policy
-        self.agent.mode = mode
-        # 计划模式要把【计划文件路径】拼进每轮提示，否则模型不知道该往哪写
-        reminder = MODES[mode].prompt
-        if mode == "plan" and plan_path:
-            reminder += f"\n计划文件（把计划写在这里、用 write_file/edit_file 迭代它）：{plan_path}"
-        self.agent.mode_reminder = reminder
-        self.agent.subagent_reminder = MODES[mode].sub_prompt
+        self.agent.set_mode(mode)
         self.mode = mode
         self.bus.emit({"type": "state", **self.state()})   # 别的标签页的模式条也要跟着变
         return True
@@ -1323,7 +1309,7 @@ class Desk:
 
         meta = meta or {}
         restored = meta.get("mode") or self.mode
-        if restored not in MODES or restored == "plan":
+        if restored not in MODES:
             restored = DEFAULT_MODE
 
         # ③ 建新 Agent。三条硬约束：

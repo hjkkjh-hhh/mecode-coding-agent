@@ -160,7 +160,7 @@ def test_real_http_stop_and_resume(stage, tmp_path, monkeypatch, workers):
             assert not workers[0].thread.is_alive()
             assert not any(isinstance(e, Retrying) for e in consumer.events)
             assert any(isinstance(e, Notice) and '已打断' in e.text for e in consumer.events)
-            expected = [{'role': 'user', 'content': 'hi'}]
+            expected = [{'role': 'user', 'content': 'hi'}, agent._mode_message()]
             if stage == 'partial':
                 expected.append({'role': 'assistant', 'content': 'partial'})
             expected.append(MARKER)
@@ -171,7 +171,8 @@ def test_real_http_stop_and_resume(stage, tmp_path, monkeypatch, workers):
             state['stage'] = 'ok'
             list(agent.run_turn('continue'))
             assert len(requests) == 2
-            assert requests[1]['messages'] == [{'role': 'system', 'content': 's'}] + expected + [
+            wire_expected = [{k: v for k, v in m.items() if k != '_mode'} for m in expected]
+            assert requests[1]['messages'] == [{'role': 'system', 'content': 's'}] + wire_expected + [
                 {'role': 'user', 'content': 'continue'}]
             assert store.load_messages()[-1]['content'] == 'resumed'
         finally:

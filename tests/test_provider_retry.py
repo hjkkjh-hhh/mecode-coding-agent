@@ -106,7 +106,8 @@ def test_思考重试后存档和下一轮只包含新思考且保留已报告�
     assert requests[0] == requests[1]
     list(agent.run_turn("continue"))
     assert "discard this" not in json.dumps(requests[2])
-    assert requests[2]["messages"][2]["reasoning_content"] == "new thought"
+    assert [m["reasoning_content"] for m in requests[2]["messages"]
+            if m["role"] == "assistant"] == ["new thought"]
 
 
 def test_已输出正文不重试且正文落盘(tmp_path):
@@ -234,7 +235,7 @@ def test_主动停止遇到读取超时仍保存中断标记(tmp_path, partial):
         agent.request_interrupt, httpx.ReadTimeout("timeout"),
     ]
     events = list(agent.run_turn("hi"))
-    expected = [{"role": "user", "content": "hi"}]
+    expected = [{"role": "user", "content": "hi"}, agent._mode_message()]
     if partial:
         expected.append({"role": "assistant", "content": "partial"})
     expected.append({"role": "user", "content": "[Request interrupted by user]"})

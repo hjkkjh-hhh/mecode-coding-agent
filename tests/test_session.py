@@ -239,6 +239,47 @@ def test_list_sessions_无会话目录返回空(tmp_path):
     assert SessionStore.list_sessions(root=tmp_path, cwd=tmp_path) == []
 
 
+def test_header_mode_and_worker_usage_updates_are_serialized(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    st = _store(tmp_path)
+    st.write_header(title="任务", mode="normal")
+    reading, release, mode_started = threading.Event(), threading.Event(), threading.Event()
+    read_text = Path.read_text
+    first = True
+
+    def pause_first_read(path, *args, **kwargs):
+        nonlocal first
+        text = read_text(path, *args, **kwargs)
+        if path == st.session_json and first:
+            first = False
+            reading.set()
+            assert release.wait(3)
+        return text
+
+    def switch():
+        mode_started.set()
+        st.write_header(mode="plan")
+
+    monkeypatch.setattr(Path, "read_text", pause_first_read)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        usage = pool.submit(st.write_header, context_tokens=123)
+        try:
+            assert reading.wait(3)
+            mode = pool.submit(switch)
+            assert mode_started.wait(3)
+            # 用量写入已读到旧头但尚未写回；模式更新应等待这次读-改-写完成。
+            assert not mode.done()
+        finally:
+            release.set()
+        usage.result(timeout=3)
+        mode.result(timeout=3)
+    meta = json.loads(st.session_json.read_text(encoding="utf-8"))
+    assert meta["mode"] == "plan" and meta["context_tokens"] == 123
+    assert meta["title"] == "任务"
+
+
 def test_write_header_持久化mode与上下文用量_list可读回(tmp_path):
     st = SessionStore(root=tmp_path, cwd=tmp_path, session_id="s")
     st.write_header(title="t", mode="yolo", context_tokens=1234)     # 模式 + 上下文用量随会话头落盘
@@ -490,13 +531,14 @@ def test_resume_续写同一transcript_且新鲜system不落盘(tmp_path):
     st = SessionStore(root=tmp_path, cwd=tmp_path, session_id="s1")
     a1 = Agent(_TextProvider(), _reg("noop", "x"), system_prompt="老SYS", store=st)
     list(a1.run_turn("问题1"))
-    msgs = st.load_messages()                                         # [问题1, 回答]（system 不落盘）
+    msgs = st.load_messages()                                         # 对话 + 模式声明（system 不落盘）
     # 用同一 store 续会话：换新鲜 system，灌入历史对话
     a2 = Agent(_TextProvider(), _reg("noop", "x"), system_prompt="新SYS",
                store=st, resume_messages=msgs)
     assert a2.messages[0] == {"role": "system", "content": "新SYS"}   # 新鲜 system 打头
     assert "问题1" in [m.get("content") for m in a2.messages]         # 历史对话接上
     list(a2.run_turn("问题2"))
-    contents = [json.loads(x).get("content")
-                for x in st.transcript_path.read_text(encoding="utf-8").splitlines()]
+    saved = [json.loads(x) for x in st.transcript_path.read_text(encoding="utf-8").splitlines()]
+    contents = [m.get("content") for m in saved if "_mode" not in m]
     assert contents == ["问题1", "回答", "问题2", "回答"]              # 续写同一 transcript，无 system、不重复
+    assert sum("_mode" in m for m in saved) == 1                       # resume 不重复模式声明
