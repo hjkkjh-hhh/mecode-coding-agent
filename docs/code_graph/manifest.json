@@ -1,0 +1,38 @@
+{
+  "created_at": "2026-10-09T13:13:26.296370+00:00",
+  "repository": "hjkkjh-hhh/mecode-coding-agent",
+  "base_commit": "1406008fb6fd38e0b6b7b6ad143cb62694603d80",
+  "source_commit": "58c464ee33cd2620e921937465290af521d5eb57",
+  "uses_uncommitted_working_tree": false,
+  "renderer_repository": "https://github.com/biubiubiu533/Code_Flow_Graph",
+  "renderer_commit": "20d33c52573d210f774a3141ab088f3f73f37928",
+  "renderer_sha256": "0bfad0902656ab367f3158e94c62f58a0769df34aca452277e56cbb4ceff9adc",
+  "source_sha256": {
+    "scripts/deskserve.py": "efdf62bfbb7b73feca3f37c8bdd3fc23780c6fa510cb68d3be88091b66893858",
+    "scripts/tui.py": "6dd1a731eeb04b6da20c4b3405b1de98f840ee420eba5b97f56d85d5745d7bbc",
+    "src/mecode/agent.py": "234f3076705eb5a8c869a992bd6eefc8c4115d8c489bb771c2f930d91f165463",
+    "src/mecode/background.py": "4336c0e368fc6b7b1f309e4e1c5bc4875e337f60bc97f498dae2be032ca5d033",
+    "src/mecode/bootstrap.py": "a97d1f3d093e94a6963a225ab67d2c8f706b20beed06b18705228db3890ab9f4",
+    "src/mecode/cli.py": "4e3ec32dab73a7d0adb75e2a6ba3c6d5a6afc8a01af97c5df6e626b975ebf1fe",
+    "src/mecode/compact.py": "03caaeca5fada7ea1d5c40ddc465b6ef2545e57e74090a571e8e0b635d407c59",
+    "src/mecode/mcp.py": "b63f849c1771a3a41840bd895610394d826f4bf2029fe64b5f9f52d6e949871a",
+    "src/mecode/provider.py": "d34f7b717d98639ed0a99dda776c0b109694131fbbfc956d3fd9fc015bf5eab6",
+    "src/mecode/session.py": "b4f83340736b4d3b02bcce293bd328d6faf6994bf0da4be848837660bfd92e30",
+    "src/mecode/subagent.py": "c2286cc21a2008f35b396c17768014a0152123e30925cbaa16203b5e618bbde9",
+    "src/mecode/tools.py": "86deeeb5a7408006ea0509ae02957f194c3d6e9bf18ead08795e73b50aca1535"
+  },
+  "diagrams": {
+    "overview": {
+      "nodes": 12,
+      "connections": 16
+    },
+    "agent_main_loop": {
+      "nodes": 7,
+      "connections": 19
+    },
+    "ui_events": {
+      "nodes": 6,
+      "connections": 17
+    }
+  }
+}

@@ -1,0 +1,52 @@
+# mecode 源码位置索引
+
+源码链接固定到提交 `58c464e`；点击可在 GitHub 打开对应代码行，不受后续修改影响。
+
+| 符号 | 代码位置 |
+| --- | --- |
+| `Bus.emit` | [scripts/deskserve.py:228](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/deskserve.py#L228) |
+| `Desk.__init__` | [scripts/deskserve.py:313](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/deskserve.py#L313) |
+| `Desk.send` | [scripts/deskserve.py:426](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/deskserve.py#L426) |
+| `Desk._pump` | [scripts/deskserve.py:443](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/deskserve.py#L443) |
+| `Desk.maybe_bg_turn` | [scripts/deskserve.py:470](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/deskserve.py#L470) |
+| `Desk.interrupt` | [scripts/deskserve.py:883](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/deskserve.py#L883) |
+| `MecodeApp._begin_interrupt` | [scripts/tui.py:2825](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/tui.py#L2825) |
+| `MecodeApp._run_agent` | [scripts/tui.py:3277](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/tui.py#L3277) |
+| `MecodeApp._run_bg_agent` | [scripts/tui.py:3358](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/tui.py#L3358) |
+| `MecodeApp._on_event` | [scripts/tui.py:3722](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/scripts/tui.py#L3722) |
+| `_tool_order_error` | [src/mecode/agent.py:70](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L70) |
+| `Agent._record` | [src/mecode/agent.py:209](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L209) |
+| `Agent.queue_user` | [src/mecode/agent.py:260](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L260) |
+| `Agent.request_interrupt` | [src/mecode/agent.py:275](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L275) |
+| `Agent._kill_running_procs` | [src/mecode/agent.py:284](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L284) |
+| `Agent.run_turn` | [src/mecode/agent.py:290](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L290) |
+| `Agent._persist_context_size` | [src/mecode/agent.py:319](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L319) |
+| `Agent._maybe_compact` | [src/mecode/agent.py:325](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L325) |
+| `Agent._pre_turn` | [src/mecode/agent.py:366](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L366) |
+| `Agent._inject_mode_reminder` | [src/mecode/agent.py:390](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L390) |
+| `Agent._run_loop_guarded` | [src/mecode/agent.py:421](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L421) |
+| `Agent._inject_bg_events` | [src/mecode/agent.py:445](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L445) |
+| `Agent._fill_interrupted_tool_results` | [src/mecode/agent.py:503](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L503) |
+| `Agent._turn_loop` | [src/mecode/agent.py:553](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L553) |
+| `Agent._process_result` | [src/mecode/agent.py:729](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L729) |
+| `Agent._exec_tool` | [src/mecode/agent.py:737](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L737) |
+| `Agent._exec_reads_batch` | [src/mecode/agent.py:785](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L785) |
+| `Agent._exec_parallel_batch` | [src/mecode/agent.py:793](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L793) |
+| `Agent._assistant_msg` | [src/mecode/agent.py:874](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/agent.py#L874) |
+| `BackgroundManager.start` | [src/mecode/background.py:72](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/background.py#L72) |
+| `BackgroundManager._finish` | [src/mecode/background.py:210](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/background.py#L210) |
+| `BackgroundManager.drain_completions` | [src/mecode/background.py:265](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/background.py#L265) |
+| `build_agent` | [src/mecode/bootstrap.py:39](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/bootstrap.py#L39) |
+| `main` | [src/mecode/cli.py:30](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/cli.py#L30) |
+| `compact` | [src/mecode/compact.py:291](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/compact.py#L291) |
+| `MCPClient.start` | [src/mecode/mcp.py:72](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/mcp.py#L72) |
+| `MCPClient.call_tool` | [src/mecode/mcp.py:100](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/mcp.py#L100) |
+| `Provider._for_wire` | [src/mecode/provider.py:289](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/provider.py#L289) |
+| `Provider.stream` | [src/mecode/provider.py:314](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/provider.py#L314) |
+| `SessionStore.append_transcript` | [src/mecode/session.py:93](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/session.py#L93) |
+| `SessionStore.load_messages` | [src/mecode/session.py:107](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/session.py#L107) |
+| `SessionStore.offload_tool_output` | [src/mecode/session.py:330](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/session.py#L330) |
+| `SubagentRunner.run` | [src/mecode/subagent.py:106](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/subagent.py#L106) |
+| `SubagentRunner.run_for_bg` | [src/mecode/subagent.py:130](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/subagent.py#L130) |
+| `ToolRegistry.schemas` | [src/mecode/tools.py:91](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/tools.py#L91) |
+| `ToolRegistry.execute` | [src/mecode/tools.py:118](https://github.com/hjkkjh-hhh/mecode-coding-agent/blob/58c464ee33cd2620e921937465290af521d5eb57/src/mecode/tools.py#L118) |
