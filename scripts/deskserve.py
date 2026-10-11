@@ -444,11 +444,11 @@ class Desk:
         """事件泵。四条必须逐字照抄 TUI：try 泵 / 后端错转人话 Notice / 其它异常也转 Notice /
         finally 无条件发轮终止哨兵——少了最后一条，一次崩溃就让前端永远卡在"忙"。
 
-        text=None 走 run_bg_turn（无用户输入的接续轮）。【不能拿空串走 run_turn】——那会往
+        text=None 表示无新用户输入的接续轮。【不能拿空串代替 None】——那会往
         transcript 里记一条空的 user 消息，历史里凭空多出一条谁也没说过的话。
         """
         try:
-            stream = self.agent.run_turn(text) if text is not None else self.agent.run_bg_turn()
+            stream = self.agent.run_turn(text)
             for ev in stream:
                 msg = encode(ev)
                 if msg is not None:

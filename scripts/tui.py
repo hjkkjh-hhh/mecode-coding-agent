@@ -3356,9 +3356,9 @@ class MecodeApp(App):
 
     @work(thread=True, exclusive=True)
     def _run_bg_agent(self) -> None:
-        # 同 _run_agent，但跑 run_bg_turn（无用户输入，靠 drain 出的完成通知驱动）。
+        # 同 _run_agent，但不传新用户输入，靠 drain 出的后台通知或排队消息驱动。
         try:
-            for ev in self.agent.run_bg_turn():
+            for ev in self.agent.run_turn():
                 self.post_message(AgentEvent(ev))
         except ProviderError as e:
             self.post_message(AgentEvent(Notice(str(e))))

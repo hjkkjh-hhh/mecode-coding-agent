@@ -11,6 +11,8 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from mecode.agent import Agent
 from mecode.config import agent_config
 from mecode.events import Done, TextDelta, ToolCall, Usage
@@ -497,18 +499,43 @@ def test_运行时排队用户消息_下轮顶部注入为user消息():
     assert {"role": "user", "content": "追加需求A"} in a.messages   # 作为真·user 消息进上下文
 
 
-def test_run_bg_turn_有排队用户消息也起轮_并注入():
-    a = Agent(_TextProvider(), _reg("noop", "x"), system_prompt="s")
+def test_无输入轮_有排队用户消息也起轮_并存盘(tmp_path):
+    st = _store(tmp_path)
+    st.write_header(title="原会话", context_tokens=7)
+    a = Agent(_TextProvider(), _reg("noop", "x"), system_prompt="s", store=st)
     a.queue_user("你在干嘛")
-    list(a.run_bg_turn())                              # 有排队消息 → 不空操作，跑一轮
-    assert {"role": "user", "content": "你在干嘛"} in a.messages
+    list(a.run_turn())                               # 有排队消息 → 不空操作，跑一轮
+    users = [m for m in a.messages if m["role"] == "user" and "_mode" not in m]
+    assert users == [{"role": "user", "content": "你在干嘛"}]
     assert not a.has_pending_user()
+    assert st.load_messages() == a.messages[1:]
+    meta = json.loads(st.session_json.read_text(encoding="utf-8"))
+    assert meta["title"] == "原会话" and meta["context_tokens"] == 100
 
 
-def test_run_bg_turn_无任何pending_空操作():
-    a = Agent(_TextProvider(), _reg("noop", "x"), system_prompt="s")
-    assert list(a.run_bg_turn()) == []                 # 无 bg、无排队 → 不起空轮
+@pytest.mark.parametrize("args", [(), (None,)], ids=["omitted", "explicit_none"])
+def test_run_turn_无输入且无待办_不准备也不存盘(tmp_path, args):
+    st = _store(tmp_path)
+    a = Agent(_TextProvider(), _reg("noop", "x"), system_prompt="s", store=st)
+    a._interrupt.set()
+    a._pending_reminder = "下一轮再处理"
+    assert list(a.run_turn(*args)) == []              # 无 bg、无排队 → 不起空轮
     assert a.messages == [{"role": "system", "content": "s"}]
+    assert a._interrupt.is_set()
+    assert a._pending_reminder == "下一轮再处理"
+    assert not st.dir.exists()
+
+
+def test_run_turn_空字符串仍作为用户消息执行并存盘(tmp_path):
+    st = _store(tmp_path)
+    a = Agent(_TextProvider(), _reg("noop", "x"), system_prompt="s", store=st)
+    events = list(a.run_turn(""))
+    assert any(isinstance(e, TextDelta) for e in events)
+    users = [m for m in a.messages if m["role"] == "user" and "_mode" not in m]
+    assert users == [{"role": "user", "content": ""}]
+    assert st.load_messages() == a.messages[1:]
+    meta = json.loads(st.session_json.read_text(encoding="utf-8"))
+    assert meta["mode"] == a.mode and meta["context_tokens"] == 100
 
 
 def test_resume_历史起过后台任务_系统提示词后注入幻影提示():

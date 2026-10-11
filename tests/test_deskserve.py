@@ -507,30 +507,28 @@ def test_首页也在闸内():
 
 
 def test_接续轮不记空user消息(desk):
-    """兜底接续必须走 run_bg_turn；拿空串走 run_turn 会往 transcript 记一条谁也没说过的话。
-
-    桩要跟着 drain 排队消息：真 run_bg_turn 每轮开头就 drain，不 drain 的话 _pump 收尾时
-    has_pending_user() 仍为真、立刻又起一轮，无限接续——断言"只起一轮"就变成了在赌时序。
-    """
+    """兜底接续传 None；只把排队的真实消息写入内存与 transcript，不凭空添加空消息。"""
     calls = []
+    run_turn = desk.agent.run_turn
 
-    def _bg():
-        calls.append(("bg", None))
-        desk.agent._drain_pending_user()
-        return iter(())
+    def _turn(text=None):
+        calls.append(text)
+        yield from run_turn(text)
 
-    desk.agent.run_turn = lambda t: (calls.append(("turn", t)), iter(()))[1]
-    desk.agent.run_bg_turn = _bg
+    desk.agent.run_turn = _turn
     desk.agent.queue_user("插一句")
     desk.maybe_bg_turn()
-    _wait_until(lambda: calls, bool)
-    time.sleep(0.15)                      # 给"会不会多起一轮"留出暴露的时间
-    assert calls == [("bg", None)]
+    _wait_until(lambda: calls and not desk.busy, bool)
+    assert calls == [None]
+    assert not desk.agent.has_pending_user()
+    users = [m for m in desk.agent.messages if m["role"] == "user" and "_mode" not in m]
+    assert users == [{"role": "user", "content": "插一句"}]
+    assert desk.agent.store.load_messages() == desk.agent.messages[1:]
 
 
 def test_没有待办就不起空轮(desk):
     calls = []
-    desk.agent.run_bg_turn = lambda: (calls.append(1), iter(()))[1]
+    desk.agent.run_turn = lambda text=None: (calls.append(text), iter(()))[1]
     desk.maybe_bg_turn()
     time.sleep(0.2)
     assert calls == [] and desk.busy is False
@@ -539,13 +537,18 @@ def test_没有待办就不起空轮(desk):
 def test_后台任务完成会触发接续轮(desk):
     """只推事件给前端而不告诉 agent，它会一直等一个永远不来的结果。"""
     calls = []
-    desk.agent.run_bg_turn = lambda: (calls.append(1), iter(()))[1]
+    def _turn(text=None):
+        calls.append(text)
+        desk.agent._drain_pending_user()
+        return iter(())
+
+    desk.agent.run_turn = _turn
     desk.agent.queue_user("让它有待办")
     desk._on_bg_done(type("T", (), {"id": 1, "command": "c", "description": "",
                                     "is_subagent": False, "status": "done",
                                     "exit_code": 0, "output": ""})())
     _wait_until(lambda: calls, bool)
-    assert calls == [1]
+    assert calls == [None]
 
 
 # ---------------------------------------------------------------- 设置面板：模型

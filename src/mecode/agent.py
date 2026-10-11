@@ -287,16 +287,21 @@ class Agent:
         if self._subagent is not None:
             self._subagent.kill_active()
 
-    def run_turn(self, user_input: str) -> Iterator[Event]:
+    def run_turn(self, user_input: str | None = None) -> Iterator[Event]:
         """跑一整轮，把过程作为事件流产出（不负责显示）。
+        传字符串（包括空串）时记录一条新用户消息；None / 不传参数时仅消费后台通知或排队消息，
+        两者都没有则空操作（不起空轮）。
         产出的事件：ReasoningDelta/TextDelta（透传模型输出）、
         ToolStarted/ToolResult（工具执行）、Notice（加固提示）。"""
+        if user_input is None and not (self._bg.has_pending() or self.has_pending_user()):
+            return
         yield from self._pre_turn()                  # 清打断标志 +（满了就）压缩
-        self._record({"role": "user", "content": user_input})
-        if self.store is not None:
-            # 会话头：首轮设标题、每轮刷新 updated_at + 落当前模式（resume 恢复），供 /rl /rs 列会话挑选
-            with self._mode_lock:
-                self.store.write_header(title=user_input, mode=self.mode)
+        if user_input is not None:
+            self._record({"role": "user", "content": user_input})
+            if self.store is not None:
+                # 会话头：首轮设标题、每轮刷新 updated_at + 落当前模式（resume 恢复），供 /rl /rs 列会话挑选
+                with self._mode_lock:
+                    self.store.write_header(title=user_input, mode=self.mode)
         yield from self._run_loop_guarded()
         self._persist_context_size()                 # 轮末：最终上下文 token 数落会话头 → resume 立即显示
 
@@ -310,16 +315,6 @@ class Agent:
             if m.get("role") == "assistant" and (m.get("content") or "").strip():
                 return m["content"].strip()
         return ""
-
-    def run_bg_turn(self) -> Iterator[Event]:
-        """无用户输入、由消费端（TUI）驱动的一轮，靠 _turn_loop 顶部 drain 出的事件当输入：
-        ① 后台任务完成/check-in；② 运行时排队的用户消息发在本轮 drain 之后、没赶上（收尾兜底）。
-        两者都没有则空操作（不起空轮）。"""
-        if not (self._bg.has_pending() or self.has_pending_user()):
-            return
-        yield from self._pre_turn()
-        yield from self._run_loop_guarded()
-        self._persist_context_size()
 
     def _persist_context_size(self) -> None:
         """把本轮最终上下文 token 数（context_tokens，来自末次请求的 prompt_tokens）落进会话头。
@@ -369,7 +364,7 @@ class Agent:
             self._record({"role": "user", "content": _reminder(resume_hint)})
 
     def _pre_turn(self) -> Iterator[Event]:
-        """每轮公共准备：清打断标志、必要时压缩、追加一次性提示。run_turn / run_bg_turn 共用。"""
+        """每轮公共准备：清打断标志、必要时压缩、追加一次性提示。"""
         # 每轮开头清掉上一轮残留的打断标志。
         # 【已知取舍，勿当新 bug 挖】共用同一个 Event 的从属 agent（前台子 agent、workflow 阶段）
         # 开轮时也会执行这句，等于替用户撤销刚下的打断 → 存在一个"按 Ctrl+C 却没停下"的窗口。

@@ -54,7 +54,7 @@ def test_unchanged_mode_keeps_prefix_across_user_and_background_turns(tmp_path, 
     a.ask("继续")
     assert a.provider.requests[1][:len(previous)] == previous
     a.queue_user("后台续跑")
-    list(a.run_bg_turn())
+    list(a.run_turn())
     assert [m["_mode"] for m in declarations(a.messages)] == [mode]
     assert a.store.load_messages() == a.messages[1:]
     assert a.messages[0] == {"role": "system", "content": "SYS"}

@@ -296,7 +296,7 @@ def test_每轮开头清打断标志(tmp_path):
     assert not a._interrupt.is_set()                                   # 开头已清
 
 
-# ---- Step 3：后台任务完成 → 注入 user+<system-reminder> + run_bg_turn 自动接续 ----
+# ---- Step 3：后台任务完成 → 注入 user+<system-reminder> + 无输入轮接续 ----
 
 def test_后台完成被注入为user_reminder(tmp_path):
     from mecode.background import BackgroundTask
@@ -309,14 +309,14 @@ def test_后台完成被注入为user_reminder(tmp_path):
     assert "npm test" in inj[0]["content"] and "3 passed" in inj[0]["content"]  # 带命令+输出
 
 
-def test_run_bg_turn_有完成则跑_无则空操作(tmp_path):
+def test_无输入轮_有完成则跑_无则空操作(tmp_path):
     from mecode.background import BackgroundTask
     a = _agent(tmp_path)
-    assert list(a.run_bg_turn()) == []                                # 无待处理完成 → 空操作
+    assert list(a.run_turn()) == []                                  # 无待处理完成 → 空操作
     assert not any(m["role"] == "assistant" for m in a.messages)
     a._bg._done.append(BackgroundTask(id=1, command="sleep 10", proc=None,
                                       status="timeout", output="", exit_code=None))
-    events = list(a.run_bg_turn())                                     # 有完成 → 注入 + 模型回应
+    events = list(a.run_turn())                                      # 有完成 → 注入 + 模型回应
     assert any(isinstance(e, TextDelta) for e in events)
     assert any(m["role"] == "user" and "超时被终止" in m.get("content", "") for m in a.messages)
 
